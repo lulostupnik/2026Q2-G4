@@ -1,0 +1,111 @@
+name: Terraform
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  TF_VERSION: 1.16.6
+
+defaults:
+  run:
+    shell: bash # con shell explícito, GitHub agrega pipefail: un plan que falla no se esconde detrás de tee
+    working-directory: terraform/organization
+
+jobs:
+  validate:
+    name: init + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: fmt
+        run: terraform fmt -check -recursive ..
+
+      - name: init
+        run: terraform init -backend=false
+
+      - name: validate
+        run: terraform validate
+
+  plan:
+    name: plan
+    needs: validate
+    # GitHub no pasa secrets a un PR que viene de un fork ni a los de dependabot: ahí el plan se
+    # saltea en lugar de fallar.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+    runs-on: ubuntu-latest
+    env:
+      # Credenciales de AWS Academy: vencen con la sesión del laboratorio, hay que
+      # renovarlas en Settings → Secrets antes de correr el pipeline.
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+      AWS_REGION: us-east-1
+      TF_VAR_proveedor_url: ${{ vars.PROVEEDOR_URL }}
+      TF_VAR_proveedor_api_key: ${{ secrets.PROVEEDOR_API_KEY }}
+      TF_VAR_mock_api_key: ${{ secrets.MOCK_API_KEY }}
+      TF_VAR_webhook_url: ${{ vars.WEBHOOK_URL }}
+      TF_VAR_webhook_secret: ${{ secrets.WEBHOOK_SECRET }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Un repositorio sin las credenciales del laboratorio (un fork recién creado, o el del grupo
+      # con la sesión vencida) no puede hacer el plan: en un pull request se saltea con un aviso,
+      # porque el plan contra la cuenta igual corre en cada Deploy. A mano, faltarlas es un error.
+      - name: Verificar credenciales
+        id: credenciales
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+              echo "::notice::El repositorio no tiene las credenciales de AWS: se saltea el plan."
+              {
+                echo '### terraform plan'
+                echo
+                echo 'Salteado: el repositorio no tiene los secrets de AWS. El plan contra la cuenta corre en **Deploy**.'
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "disponibles=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::Faltan los secrets AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y AWS_SESSION_TOKEN."
+            exit 1
+          fi
+          aws sts get-caller-identity --query Arn --output text
+          echo "disponibles=true" >> "$GITHUB_OUTPUT"
+
+      - name: init
+        if: steps.credenciales.outputs.disponibles == 'true'
+        working-directory: .
+        run: make init
+
+      - name: tag de la imagen
+        if: steps.credenciales.outputs.disponibles == 'true'
+        working-directory: .
+        run: echo "TF_VAR_image_tag=$(make -s tag)" >> "$GITHUB_ENV"
+
+      - name: plan
+        if: steps.credenciales.outputs.disponibles == 'true'
+        run: |
+          terraform plan -no-color -lock=false -out=tfplan | tee plan.txt
+          {
+            echo '### terraform plan'
+            echo '```'
+            grep -E '^(Plan:|No changes)' plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

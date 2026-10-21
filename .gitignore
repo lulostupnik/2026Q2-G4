@@ -1,0 +1,36 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+tfplan
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# .terraform.lock.hcl SÍ se commitea: fija las versiones exactas de los providers
+# para que cualquier máquina y el pipeline usen las mismas.
+
+# Variables: sólo el ejemplo va al repo
+*.tfvars
+*.tfvars.json
+!terraform.tfvars.example
+
+# Secretos
+*.pem
+*.key
+.env
+.env.*
+
+# Editores / sistema
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Zips que arma archive_file (Lambda del callback)
+**/.build/

@@ -1,0 +1,7 @@
+#!/bin/bash
+cat >> /etc/ecs/ecs.config <<'CONFIG'
+ECS_CLUSTER=${cluster}
+ECS_CONTAINER_STOP_TIMEOUT=30s
+ECS_IMAGE_PULL_BEHAVIOR=prefer-cached
+ECS_AWSVPC_BLOCK_IMDS=true
+CONFIG

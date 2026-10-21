@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Núcleo — tu billetera</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%234f46e5'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="estilos.css">
+</head>
+<body>
+
+<section id="acceso" class="acceso" hidden>
+  <div class="acceso-presentacion">
+    <div class="marca marca-clara"><span class="marca-logo"></span>núcleo</div>
+    <h1 class="acceso-titular">Tu plata, al instante.</h1>
+    <p class="acceso-bajada">Enviá dinero a otras cuentas, ingresá desde tu banco y retirá cuando quieras.</p>
+    <ul class="acceso-virtudes">
+      <li><span class="virtud-icono" data-icono="rayo"></span>Transferencias inmediatas y sin costo</li>
+      <li><span class="virtud-icono" data-icono="retirar"></span>Ingresos y retiros a cualquier CBU o CVU</li>
+      <li><span class="virtud-icono" data-icono="escudo"></span>Cada movimiento queda registrado y se puede auditar</li>
+    </ul>
+  </div>
+
+  <div class="acceso-panel">
+    <form class="tarjeta-acceso" id="form-acceso">
+      <div class="marca marca-movil"><span class="marca-logo"></span>núcleo</div>
+      <h2>Ingresá a tu cuenta</h2>
+      <p class="ayuda">Vas a iniciar sesión con Cognito y volver acá. Si es tu primera vez, ahí mismo podés registrarte.</p>
+      <button class="boton boton-primario boton-ancho boton-grande" type="submit" id="acceso-entrar">Ingresar</button>
+      <p class="error" id="acceso-error" role="alert" hidden></p>
+      <div class="acceso-pie">
+        <button type="button" class="enlace enlace-tenue" id="acceso-servidor">Estado del servicio</button>
+      </div>
+    </form>
+
+    <form class="tarjeta-acceso" id="form-alta" autocomplete="off" novalidate hidden>
+      <div class="marca marca-movil"><span class="marca-logo"></span>núcleo</div>
+      <h2>Elegí tu alias</h2>
+      <p class="ayuda" id="alta-quien"></p>
+
+      <label class="campo">
+        <span class="campo-rotulo">Alias</span>
+        <span class="campo-prefijo">
+          <span class="prefijo">@</span>
+          <input id="alta-alias" name="alias" placeholder="tu.alias" required maxlength="30"
+                 autocapitalize="none" spellcheck="false" aria-describedby="alta-ayuda">
+        </span>
+        <span class="campo-ayuda" id="alta-ayuda">De 3 a 30 caracteres: letras minúsculas, números, punto, guion o guion bajo.</span>
+      </label>
+
+      <div class="nota">
+        <span data-icono="info"></span>
+        <span>Tu cuenta arranca con saldo de prueba para que puedas usarla enseguida.</span>
+      </div>
+
+      <button class="boton boton-primario boton-ancho boton-grande" type="submit">Crear cuenta</button>
+      <p class="error" id="alta-error" role="alert" hidden></p>
+
+      <div class="acceso-pie">
+        <button type="button" class="enlace enlace-tenue" id="alta-salir">Usar otra cuenta</button>
+        <button type="button" class="enlace enlace-tenue" id="alta-servidor">Estado del servicio</button>
+      </div>
+    </form>
+  </div>
+</section>
+
+<div id="aplicacion" class="aplicacion" hidden>
+  <aside class="lateral">
+    <div class="marca"><span class="marca-logo"></span>núcleo</div>
+    <nav class="lateral-nav" id="nav" aria-label="Secciones"></nav>
+    <div class="lateral-pie" id="lateral-pie"></div>
+  </aside>
+
+  <header class="barra-movil">
+    <div class="marca"><span class="marca-logo"></span>núcleo</div>
+    <button class="avatar-boton" id="menu-perfil-movil" aria-label="Tu cuenta"></button>
+  </header>
+
+  <main id="hoja" class="hoja" tabindex="-1"></main>
+
+  <nav class="barra-inferior" id="nav-movil" aria-label="Secciones"></nav>
+</div>
+
+<dialog id="dialogo-servidor" class="dialogo">
+  <form method="dialog">
+    <div class="dialogo-cabecera">
+      <span class="dialogo-icono" data-icono="servidor"></span>
+      <h2>Estado del servicio</h2>
+    </div>
+    <div class="rejilla" id="servidor-datos"></div>
+    <p class="ayuda" id="servidor-estado"></p>
+    <menu>
+      <button class="boton boton-primario" value="cerrar">Cerrar</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="dialogo-claves" class="dialogo">
+  <form method="dialog">
+    <div class="dialogo-cabecera">
+      <span class="dialogo-icono" data-icono="llave"></span>
+      <h2>Modo operación</h2>
+    </div>
+    <p class="ayuda">Sólo para quien opera el despliegue. Las claves están en Secrets Manager
+      (<code>ledger/api</code>). Quedan en esta pestaña y se borran al cerrar sesión.</p>
+    <label class="campo">
+      <span class="campo-rotulo">Clave de administración</span>
+      <input id="clave-admin" type="password" autocomplete="off" placeholder="ADMIN_API_KEY">
+    </label>
+    <label class="campo">
+      <span class="campo-rotulo">Clave del proveedor simulado <small>(opcional)</small></span>
+      <input id="clave-mock" type="password" autocomplete="off" placeholder="MOCK_API_KEY">
+    </label>
+    <menu>
+      <button class="boton" value="cancelar" formnovalidate>Cancelar</button>
+      <button class="boton boton-primario" value="guardar">Activar</button>
+    </menu>
+  </form>
+</dialog>
+
+<div id="avisos" class="avisos" aria-live="polite"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

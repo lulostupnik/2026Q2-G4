@@ -1,0 +1,1053 @@
+openapi: 3.1.0
+
+info:
+  title: Núcleo Transaccional Elástico
+  version: "1.0.0"
+
+security:
+  - SesionBearer: []
+
+tags:
+  - name: sesion
+  - name: cuentas
+  - name: operaciones
+  - name: historico
+  - name: admin
+  - name: servicio-mock
+  - name: webhooks
+  - name: salud
+
+paths:
+  /:
+    get:
+      tags: [salud]
+      security: []
+      summary: Documento raíz
+      description: |
+        Punto de entrada de la API. Lista los recursos disponibles en `_links` y recuerda
+        dónde hace falta `Idempotency-Key`.
+      operationId: raiz
+      responses:
+        '200':
+          description: Documento raíz con los puntos de entrada.
+
+  /health:
+    get:
+      tags: [salud]
+      security: []
+      summary: Estado del proceso y de la base
+      description: |
+        Responde por el proceso: contesta 200 mientras atiende. También hace un `Ping` a la
+        base, pero su resultado va en el cuerpo (`base`, `estado: degradado`) y no cambia el
+        código: si una caída de la base sacara a todas las tareas del target group, ECS las
+        reemplazaría en loop sin arreglar nada.
+      operationId: salud
+      responses:
+        '200':
+          description: El proceso atiende. `estado` dice si la base respondió.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  estado: { type: string, example: ok, enum: [ok, degradado] }
+                  base: { type: string, example: ok }
+
+  /sesiones/actual:
+    get:
+      tags: [sesion]
+      summary: Quién dice ser el token que traés
+      description: |
+        Lo que la app llama al volver del login para saber quién es el usuario y si ya tiene
+        cuenta. Si `cuenta_id` es `null`, el siguiente paso es `POST /cuentas`.
+      responses:
+        "200":
+          description: La sesión vigente.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sesion: { type: boolean }
+                  sub: { type: string, description: El `sub` del usuario en Cognito. }
+                  cuenta_id: { type: [integer, "null"], format: int64 }
+                  alias: { type: string }
+                  expira_en: { type: string, format: date-time }
+        "401": { description: Falta el token, venció o no es válido. }
+        "503": { description: No se pudieron leer las claves de Cognito. }
+
+  /ingresos/{id}/simular-deposito:
+    post:
+      tags: [operaciones]
+      summary: Simular que el usuario transfirió desde su banco
+      description: |
+        El ingreso es la única de las tres operaciones que depende de un hecho que ocurre
+        **afuera**: nadie crea dinero haciendo una petición, así que la carga queda pendiente
+        hasta que aparece el crédito del lado del proveedor. Esta ruta produce ese crédito y
+        después concilia, para poder demostrar el circuito completo.
+
+        **Va contra el proveedor VIGENTE**, que puede ser el mock propio o el balanceador de
+        otro equipo. Ésa es la razón de que exista: un cliente que le pegara a `/servicio-mock` de
+        su propia API estaría depositando en una tabla que su conciliación no lee nunca.
+        La app no conoce la URL del proveedor ni su secreto, y no tiene por qué.
+
+        El monto y la referencia salen de la orden, no del pedido: no se puede acreditar un
+        importe arbitrario ni atribuirle un depósito a la carga de otro. Es idempotente —el
+        id de origen se deriva de la referencia— y exige ser parte de la orden.
+      parameters:
+        - $ref: "#/components/parameters/IdOrden"
+      responses:
+        "200":
+          description: La orden ya conciliada. Normalmente queda `atribuida`.
+        "403": { description: La carga no es tuya. }
+        "409": { description: La carga ya no está pendiente, o no tiene referencia. }
+        "502": { description: El proveedor no aceptó el depósito. }
+
+  /webhooks/recibidos:
+    post:
+      tags: [webhooks]
+      summary: Recibir un aviso de otro despliegue
+      security: []
+      description: |
+        El otro extremo del webhook: recibe los avisos que emite otro despliegue de esta
+        misma API y los deja registrados.
+
+        No lleva sesión: quien llama no es un usuario sino un sistema, y lo que lo acredita
+        es el HMAC del cuerpo en `X-Ledger-Signature`. Tampoco mueve dinero — sólo registra.
+
+        Un aviso con firma inválida **se guarda igual** y se contesta 401: es lo único que
+        queda para mostrar que alguien mandó algo que no salió de un emisor legítimo.
+      parameters:
+        - name: X-Ledger-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 en hexadecimal del cuerpo exacto, con `WEBHOOK_SECRET`.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orden_id: { type: integer, format: int64 }
+                tipo: { type: string }
+                estado: { type: string }
+                monto_centavos: { type: integer, format: int64 }
+                referencia: { type: string }
+      responses:
+        "200": { description: Aviso registrado con la firma verificada. }
+        "401": { description: La firma no coincide. Queda registrado igual. }
+    get:
+      tags: [webhooks]
+      summary: Los avisos recibidos
+      security: []
+      description: |
+        Lo que muestra el área de Operación de la app. Pide la clave de `/admin/*`: los avisos
+        traen montos, referencias y el cuerpo completo.
+      parameters:
+        - $ref: '#/components/parameters/ClaveAdmin'
+        - name: limite
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: Los últimos avisos, del más nuevo al más viejo.
+        '401': { $ref: '#/components/responses/AdminNoAutorizado' }
+
+  /cuentas:
+    post:
+      tags: [cuentas]
+      summary: Crear una cuenta virtual
+      description: |
+        La cuenta queda a nombre del usuario del token: cada usuario de Cognito tiene una
+        sola cuenta, y es la única que puede leer y operar.
+
+        Cada cuenta nueva arranca con un saldo de bienvenida que fija el server
+        (`SALDO_BIENVENIDA_CENTAVOS`, $ 50.000 por defecto; 0 lo desactiva): el cliente no lo
+        elige. **Se asienta contra la cuenta interna de ajustes**, de modo que el ledger sigue
+        balanceado: no aparece dinero de la nada, aparece un ajuste explícito y auditable. En
+        producción el saldo entra por `/ingresos`.
+      operationId: crearCuenta
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [alias, tipo]
+              properties:
+                alias: { type: string, example: ana }
+                tipo: { type: string, enum: [usuario, comercio] }
+      responses:
+        '201':
+          description: Creada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Cuenta' }
+        '400': { $ref: '#/components/responses/Invalido' }
+        '401': { description: Falta el token, venció o no es válido. }
+        '409':
+          description: Ya existe una cuenta con ese alias, o el usuario ya tiene una.
+    get:
+      tags: [cuentas]
+      summary: Padrón de cuentas
+      operationId: listarCuentas
+      parameters:
+        - { name: tipo, in: query, schema: { type: string, enum: [usuario, comercio, interna] } }
+        - { name: limite, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: desde, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: Listado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cuentas:
+                    type: array
+                    items: { $ref: '#/components/schemas/CuentaDetalle' }
+
+  /cuentas/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdCuenta'
+    get:
+      tags: [cuentas]
+      summary: Ficha de una cuenta
+      operationId: verCuenta
+      responses:
+        '200':
+          description: Ficha.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CuentaDetalle' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    patch:
+      tags: [cuentas]
+      summary: Activar, desactivar o fijar el límite
+      description: |
+        No permite editar el saldo ni el alias: el saldo sólo se mueve por asientos —si se
+        pudiera editar, el ledger dejaría de ser la fuente de verdad— y el alias es la
+        identidad con la que ya se registraron operaciones.
+
+        Desactivar no borra. Una cuenta inactiva no puede originar operaciones, pero sigue
+        pudiendo recibir y su historial sigue en el ledger.
+      operationId: actualizarCuenta
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                activa: { type: boolean }
+                limite_por_operacion_centavos: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Actualizada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CuentaDetalle' }
+        '400': { $ref: '#/components/responses/Invalido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /cuentas/{id}/saldo:
+    parameters:
+      - $ref: '#/components/parameters/IdCuenta'
+    get:
+      tags: [cuentas]
+      summary: Saldo vigente y saldo derivado
+      description: |
+        Devuelve **los dos** saldos: el vigente (la fila de `saldos`, mantenida en la misma
+        transacción que inserta los asientos) y el derivado del ledger (saldo de apertura
+        del último corte más la suma de los asientos posteriores).
+
+        Tienen que coincidir siempre, y siguen coincidiendo **después de archivar**: ése es
+        el punto del modelo de saldo en tres capas.
+      operationId: saldo
+      responses:
+        '200':
+          description: Saldo.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cuenta_id: { type: integer, format: int64 }
+                  saldo_vigente_centavos: { type: integer, format: int64 }
+                  saldo_derivado_centavos: { type: integer, format: int64 }
+                  coincide: { type: boolean }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /cuentas/{id}/movimientos:
+    parameters:
+      - $ref: '#/components/parameters/IdCuenta'
+    get:
+      tags: [historico]
+      summary: Extracto reciente, o de un período (que puede estar archivado)
+      description: |
+        **Sin `periodo`**: extracto reciente paginado, siempre desde la base.
+
+        **Con `periodo=AAAA-MM`**: extracto de ese mes. La API consulta la tabla
+        `periodos_archivados` —el índice del archivo— y lee de la base o del objeto en S3
+        según corresponda. El campo `origen` de la respuesta dice de dónde salió.
+      operationId: movimientos
+      parameters:
+        - name: periodo
+          in: query
+          schema: { type: string, pattern: '^\d{4}-\d{2}$' }
+          example: "2026-06"
+        - { name: limite, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: desde, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: |
+            Sin `periodo` devuelve `{ "movimientos": [...] }`; con `periodo`, el extracto
+            del mes con su origen.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      movimientos:
+                        type: array
+                        items: { $ref: '#/components/schemas/Movimiento' }
+                  - $ref: '#/components/schemas/ExtractoPeriodo'
+              examples:
+                archivado:
+                  summary: Un mes que ya salió de la base
+                  value:
+                    cuenta_id: 5
+                    periodo: "2026-06"
+                    origen: archivo
+                    objeto: transaction-history/periodo=2026-06/asientos.ndjson.gz
+                    movimientos:
+                      - periodo: "2026-06-01T00:00:00Z"
+                        orden_id: 3
+                        contraparte_id: 6
+                        monto_centavos: -1000
+                        tramo: transferencia
+                        creado_en: "2026-06-04T10:22:13Z"
+        '400': { $ref: '#/components/responses/Invalido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /transferencias:
+    post:
+      tags: [operaciones]
+      summary: Transferir entre dos cuentas del PSP
+      operationId: transferir
+      parameters:
+        - $ref: '#/components/parameters/ClaveIdempotencia'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [origen_id, destino_id, monto_centavos]
+              properties:
+                origen_id: { type: integer, format: int64 }
+                destino_id: { type: integer, format: int64 }
+                monto_centavos: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: Liquidada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Orden' }
+        '400': { $ref: '#/components/responses/Invalido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '422': { $ref: '#/components/responses/Rechazada' }
+
+  /transferencias/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdOrden' }]
+    get:
+      tags: [operaciones]
+      summary: Estado de una transferencia
+      operationId: verTransferencia
+      responses:
+        '200':
+          description: Orden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Orden' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /egresos:
+    post:
+      tags: [operaciones]
+      summary: Enviar dinero fuera del PSP
+      operationId: egresar
+      parameters:
+        - $ref: '#/components/parameters/ClaveIdempotencia'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [origen_id, cbu_destino, monto_centavos]
+              properties:
+                origen_id: { type: integer, format: int64 }
+                cbu_destino: { type: string }
+                monto_centavos: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: Resuelta (`acreditada` o `devuelta`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Orden' }
+        '202':
+          description: En duda. El resultado se conoce consultando la orden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Orden' }
+        '400': { $ref: '#/components/responses/Invalido' }
+        '422': { $ref: '#/components/responses/Rechazada' }
+
+  /egresos/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdOrden' }]
+    get:
+      tags: [operaciones]
+      summary: Estado de un egreso — y lo resuelve si estaba en duda
+      description: |
+        No es una consulta pasiva: si la orden está `en_duda`, esta llamada pregunta al
+        proveedor y la resuelve. Quien pregunta es el interesado, así que es el momento
+        correcto para gastar una llamada saliente.
+      operationId: verEgreso
+      responses:
+        '200':
+          description: Resuelta.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Orden' }
+        '202':
+          description: Sigue en duda.
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /ingresos:
+    post:
+      tags: [operaciones]
+      summary: Crear la intención de un ingreso
+      description: |
+        Devuelve una **referencia** corta y sin caracteres ambiguos, porque una persona la
+        tipea en el homebanking de su banco. Es lo que después permite atribuir el
+        movimiento sin ambigüedad.
+      operationId: crearIngreso
+      parameters:
+        - $ref: '#/components/parameters/ClaveIdempotencia'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destino_id, monto_centavos]
+              properties:
+                destino_id: { type: integer, format: int64 }
+                monto_centavos: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '201':
+          description: Intención creada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Orden' }
+        '400': { $ref: '#/components/responses/Invalido' }
+
+  /ingresos/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdOrden' }]
+    get:
+      tags: [operaciones]
+      summary: Estado de un ingreso — concilia contra el proveedor si corresponde
+      operationId: verIngreso
+      responses:
+        '200':
+          description: Orden.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Orden' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /exportaciones:
+    post:
+      tags: [historico]
+      summary: Exportar el histórico de un rango de meses
+      description: |
+        Registra la solicitud y **la resuelve dentro del mismo request**, cruzando períodos
+        que están en línea con períodos ya archivados. El rango se acota a 24 meses.
+      operationId: exportar
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [desde, hasta]
+              properties:
+                cuenta_id:
+                  type: integer
+                  format: int64
+                  description: Omitido o 0 exporta todas las cuentas (exportación contable).
+                desde: { type: string, pattern: '^\d{4}-\d{2}$', example: "2026-01" }
+                hasta: { type: string, pattern: '^\d{4}-\d{2}$', example: "2026-06" }
+      responses:
+        '201':
+          description: Resuelta.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Exportacion' }
+        '400': { $ref: '#/components/responses/Invalido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /exportaciones/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdOrden' }]
+    get:
+      tags: [historico]
+      summary: Resultado de una exportación ya hecha
+      operationId: verExportacion
+      responses:
+        '200':
+          description: Solicitud.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Exportacion' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /admin/cierre:
+    post:
+      tags: [admin]
+      security: []
+      parameters: [{ $ref: '#/components/parameters/ClaveAdmin' }]
+      summary: Verificar el cierre contable
+      operationId: cierre
+      responses:
+        '401': { $ref: '#/components/responses/AdminNoAutorizado' }
+        '200':
+          description: Resultado del cierre.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  momento: { type: string, format: date-time }
+                  cierra: { type: boolean }
+                  transitorias: { type: array, items: { type: object } }
+                  descuadres: { type: array, items: { type: object } }
+
+  /admin/archivado:
+    post:
+      tags: [admin]
+      security: []
+      summary: Agendar el archivado del próximo período elegible
+      description: |
+        Deja la tarea pendiente en la base. **Quien la ejecuta es el servicio de
+        archivado, no la API.** El planificador vive en una tabla y no en un cron: un cron se
+        saltea la ejecución en silencio si el proceso no estaba corriendo, que acá ocurre casi
+        siempre porque el archivador tiene cero tareas fuera de su ventana.
+      operationId: agendarArchivado
+      parameters:
+        - $ref: '#/components/parameters/ClaveAdmin'
+        - name: retencion_meses
+          in: query
+          description: Baja la retención para la demo. Por defecto 12.
+          schema: { type: integer, minimum: 0, default: 12 }
+      responses:
+        '401': { $ref: '#/components/responses/AdminNoAutorizado' }
+        '202':
+          description: Agendado.
+        '200':
+          description: No hay ningún período cerrado fuera de la ventana de retención.
+
+  /admin/reinicio:
+    post:
+      tags: [admin]
+      summary: Borrar todos los datos de la demo
+      security: []
+      description: |
+        **Sólo demo, y destructivo.** Es la contraparte de `POST /admin/semilla`: si hay una
+        ruta de administración que escribe datos de demostración, la que los saca es la misma
+        herramienta al revés.
+
+        Borra cuentas, órdenes, asientos, transiciones, movimientos, avisos recibidos y el
+        estado del proveedor simulado. **No** toca el esquema, ni las particiones, ni
+        `migraciones`, ni `proveedor_activo` —que es configuración en vivo, no dato—.
+
+        **Las cuatro cuentas internas se conservan**, y no por comodidad: sus ids se
+        resuelven una vez al arrancar y quedan cacheados en memoria. Borrarlas dejaría al
+        proceso apuntando a ids que ya no existen. Sus saldos sí vuelven a cero, así que
+        `POST /admin/cierre` queda cuadrado.
+
+        Todo ocurre en una transacción: si algo falla no queda un borrado a medias.
+
+        Exige `X-Admin-Key` **y** la confirmación en el cuerpo. Son dos cosas distintas: la
+        clave dice que podés hacerlo, la confirmación dice que querías. La clave viaja en
+        cada llamada del panel, así que sin lo segundo un pedido de más se lleva el ledger.
+      parameters:
+        - $ref: "#/components/parameters/ClaveAdmin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirmar]
+              properties:
+                confirmar:
+                  type: string
+                  enum: ["BORRAR TODO"]
+      responses:
+        "200":
+          description: Cuántas filas se borraron de cada tabla, y las internas conservadas.
+        "400": { description: Falta la confirmación o no es la frase exacta. }
+        "401": { description: Falta o no coincide `X-Admin-Key`. }
+
+  /admin/diagnostico:
+    get:
+      tags: [admin]
+      summary: Qué instancia atendió, y la huella de cada secreto
+      security: []
+      description: |
+        Los secretos de este sistema tienen que coincidir entre partes que no se ven, y
+        cuando no coinciden el síntoma nunca dice que el problema es ése:
+
+        - `MOCK_API_KEY` / `PROVEEDOR_API_KEY` distintos **entre los dos equipos**: los
+          egresos se rechazan y la orden queda con un motivo de credencial.
+        - `WEBHOOK_SECRET` distinto entre equipos: el aviso llega, pero marcado como firma
+          inválida del otro lado.
+
+        La huella es un SHA-256 truncado y con etiqueta de dominio: no se puede volver al
+        secreto, pero dos despliegues bien configurados muestran el mismo valor. Va detrás de
+        `X-Admin-Key` igual: un secreto corto y adivinable se podría confirmar por fuerza
+        bruta contra su huella.
+
+        Devuelve además el proveedor vigente y el estado del cursor de conciliación, que es
+        la otra mitad de lo que hay que mirar cuando un ingreso no se acredita.
+      parameters:
+        - $ref: "#/components/parameters/ClaveAdmin"
+      responses:
+        "200":
+          description: Diagnóstico del despliegue.
+        "401": { description: Falta o no coincide `X-Admin-Key`. }
+
+  /admin/proveedor:
+    get:
+      tags: [admin]
+      security: []
+      summary: A qué proveedor externo se le está pegando
+      operationId: verProveedor
+      parameters: [{ $ref: '#/components/parameters/ClaveAdmin' }]
+      responses:
+        '200':
+          description: |
+            `por_defecto: true` significa que nadie lo cambió y se está usando el valor de
+            la variable `PROVEEDOR_URL`.
+        '401': { $ref: '#/components/responses/AdminNoAutorizado' }
+    post:
+      tags: [admin]
+      security: []
+      summary: Apuntar a otro proveedor, sin redesplegar
+      description: |
+        Cambia el destino de los egresos **en caliente**: el siguiente ya sale al nuevo. Es
+        lo que permite mostrar en vivo que el proveedor es un sistema externo y no algo
+        cableado en el código — se apunta al despliegue de otro equipo y el egreso cruza.
+
+        Sólo afecta a los egresos que empiecen después. Una orden ya despachada se resuelve
+        consultando al proveedor que la recibió, y eso lo decide su referencia, no esta URL.
+
+        Se rechaza el rango link-local: ahí vive el servicio de metadatos de la instancia, y
+        apuntar el proveedor a esa dirección convertiría cada egreso en una consulta al rol
+        de la EC2.
+      operationId: cambiarProveedor
+      parameters: [{ $ref: '#/components/parameters/ClaveAdmin' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  example: http://balanceador-del-otro-equipo.elb.us-east-1.amazonaws.com/servicio-mock
+      responses:
+        '200': { description: Cambiado. }
+        '400': { $ref: '#/components/responses/Invalido' }
+        '403': { description: Destino prohibido (link-local). }
+        '401': { $ref: '#/components/responses/AdminNoAutorizado' }
+    delete:
+      tags: [admin]
+      security: []
+      summary: Volver al valor de PROVEEDOR_URL
+      operationId: restaurarProveedor
+      parameters: [{ $ref: '#/components/parameters/ClaveAdmin' }]
+      responses:
+        '200': { description: Restaurado. }
+        '401': { $ref: '#/components/responses/AdminNoAutorizado' }
+
+  /admin/semilla:
+    post:
+      tags: [admin]
+      security: []
+      parameters: [{ $ref: '#/components/parameters/ClaveAdmin' }]
+      summary: Generar asientos fechados en un período pasado (sólo demo)
+      description: |
+        Escribe por el mismo camino que la liquidación normal —orden, par de asientos y
+        saldos en la misma transacción—, sólo que con el período forzado. No es un atajo
+        que saltea el ledger: si lo fuera, el archivado no probaría nada.
+      operationId: semilla
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [periodo, origen_id, destino_id, cantidad, monto_centavos]
+              properties:
+                periodo: { type: string, pattern: '^\d{4}-\d{2}$' }
+                origen_id: { type: integer, format: int64 }
+                destino_id: { type: integer, format: int64 }
+                cantidad: { type: integer, minimum: 1, maximum: 1000 }
+                monto_centavos: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '401': { $ref: '#/components/responses/AdminNoAutorizado' }
+        '201':
+          description: Generados.
+        '400': { $ref: '#/components/responses/Invalido' }
+
+  /servicio-mock/egresos:
+    post:
+      tags: [servicio-mock]
+      security: []
+      summary: (Mock) Ordenar un egreso al proveedor
+      description: |
+        Simula el pedido de envío de dinero. Es idempotente por `referencia`, como un
+        proveedor real: reintentar el mismo pedido no mueve dinero dos veces.
+
+        El desenlace lo deciden los **dos últimos dígitos del monto**, para poder mostrar
+        los tres casos sin tocar configuración:
+
+        | Termina en | Respuesta |
+        |---|---|
+        | `13` | `rechazado` |
+        | `99` | **registra el egreso y no contesta** durante `MOCK_DEMORA_SIN_RESPUESTA` |
+        | otro | `acreditado` |
+
+        El caso `99` es el importante: el dinero salió y el que llamó no se enteró. Deja la
+        orden `en_duda` del lado del núcleo y sólo se resuelve consultando.
+      operationId: mockOrdenarEgreso
+      parameters: [{ $ref: '#/components/parameters/ClaveMock' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [referencia, cbu, monto_centavos]
+              properties:
+                referencia: { type: string }
+                cbu: { type: string }
+                monto_centavos: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Resuelto (`acreditado` o `rechazado`).
+        '400': { description: Cuerpo inválido o falta la referencia. }
+        '401': { $ref: '#/components/responses/MockNoAutorizado' }
+
+  /servicio-mock/pedidos:
+    get:
+      tags: [servicio-mock]
+      summary: Lo que le pidieron a este despliegue como proveedor
+      security: []
+      description: |
+        No es parte del contrato que el núcleo consume: es la ventana para verlo. Cuando dos
+        equipos se apuntan `PROVEEDOR_URL` cruzado, el panel de cada uno mira acá para ver
+        los egresos que le ordenó el otro — incluidos los que quedaron `sin_respuesta`, que
+        del lado de quien los pidió son una orden en duda y de este lado son plata que salió.
+      parameters:
+        - $ref: "#/components/parameters/ClaveMock"
+        - name: limite
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: Los pedidos, del más nuevo al más viejo.
+
+  /servicio-mock/egresos/{referencia}:
+    parameters:
+      - name: referencia
+        in: path
+        required: true
+        schema: { type: string }
+      - $ref: '#/components/parameters/ClaveMock'
+    get:
+      tags: [servicio-mock]
+      security: []
+      summary: (Mock) Consultar un egreso
+      description: |
+        **Siempre responde**, incluso para los pedidos que quedaron mudos al ordenarse: es
+        exactamente lo que permite resolver una operación en duda. Una referencia
+        desconocida responde `rechazado` con motivo `no registrado`, para que el núcleo
+        pueda concluir que el dinero no salió.
+      operationId: mockConsultarEgreso
+      responses:
+        '200': { description: Estado del egreso. }
+        '401': { $ref: '#/components/responses/MockNoAutorizado' }
+
+  /servicio-mock/movimientos:
+    get:
+      tags: [servicio-mock]
+      security: []
+      summary: (Mock) Créditos de la cuenta recaudadora
+      description: Lo que lee la conciliación de ingresos. Pagina por cursor numérico.
+      operationId: mockMovimientos
+      parameters:
+        - { name: desde, in: query, schema: { type: integer, default: 0 } }
+        - $ref: '#/components/parameters/ClaveMock'
+      responses:
+        '200': { description: Página de movimientos y cursor siguiente. }
+        '401': { $ref: '#/components/responses/MockNoAutorizado' }
+
+  /servicio-mock/depositos:
+    post:
+      tags: [servicio-mock]
+      security: []
+      summary: (Mock) Registrar una transferencia entrante
+      description: |
+        Simula la transferencia que una persona hace desde su banco a la cuenta
+        recaudadora. Con `referencia` válida la carga se atribuye; con referencia inválida
+        queda no atribuida.
+
+        ⚠️ Sin `MOCK_API_KEY` esta ruta permite acreditar dinero inventado en el ledger.
+      operationId: mockDeposito
+      parameters: [{ $ref: '#/components/parameters/ClaveMock' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [monto_centavos]
+              properties:
+                id_origen: { type: string, description: Se genera si no viene. }
+                referencia: { type: string }
+                monto_centavos: { type: integer, format: int64, minimum: 1 }
+                ocurrido_en: { type: string, format: date-time }
+      responses:
+        '201': { description: Registrado. }
+        '400': { description: Cuerpo inválido o monto no positivo. }
+        '401': { $ref: '#/components/responses/MockNoAutorizado' }
+
+  /servicio-mock/health:
+    get:
+      tags: [servicio-mock]
+      security: []
+      summary: (Mock) Salud del proveedor simulado
+      description: Queda sin autenticación a propósito, para que el balanceador pueda chequearlo.
+      operationId: mockSalud
+      responses:
+        '200': { description: Vivo. }
+
+components:
+  securitySchemes:
+    SesionBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token de Cognito, en `Authorization: Bearer <token>`. Lo obtiene la app con
+        el login de la Hosted UI.
+
+        La API verifica la firma RS256 contra el JWKS del user pool (`COGNITO_ISSUER`) y
+        exige `token_use=access` y el `client_id` del app client (`COGNITO_CLIENT_ID`).
+        No cree nada de lo que el cliente diga sobre quién es: lo dice la firma.
+
+        Además de exigirlo, los handlers comprueban **titularidad**: una sesión de la cuenta
+        A no puede leer el saldo de B ni transferir desde B. Eso es 403, no 401.
+
+        Un despliegue con `AUTH_ABIERTA=1` no exige sesión: es el modo de desarrollo local.
+
+  parameters:
+    ClaveIdempotencia:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Obligatoria en los tres endpoints de escritura. Sin clave no hay forma de
+        distinguir un reintento de una orden nueva, así que se rechaza con 400.
+
+        Un reintento tiene que repetir los mismos datos: con la misma clave y otra cuenta,
+        otro destino u otro monto, la respuesta es **422 `clave_reutilizada`** y no la orden
+        original. Una clave con `:` se rechaza con **400**: ese formato lo usa el
+        propio sistema (`apertura:<alias>`, `mov:<id>`).
+      schema: { type: string }
+      example: 7f3a9c12-4b8e-4d21-9a55-0c1e2f3a4b5c
+    ClaveAdmin:
+      name: X-Admin-Key
+      in: header
+      required: true
+      description: |
+        Secreto compartido de las rutas de administración. Obligatorio si el despliegue
+        define `ADMIN_API_KEY` —que es siempre, salvo que se haya pedido explícitamente
+        `ADMIN_ABIERTO=1` para desarrollo local—; sin él responden 401.
+
+        Existe porque estas rutas escriben en el ledger y quedan detrás del balanceador público:
+        `semilla` inserta asientos y `archivado` agenda el borrado de una partición.
+      schema: { type: string }
+    ClaveMock:
+      name: X-Mock-Key
+      in: header
+      description: |
+        Secreto compartido entre los dos equipos. Obligatorio si el despliegue define
+        `MOCK_API_KEY`; sin él las rutas de operación responden 401. El mock queda expuesto
+        en internet detrás del balanceador, así que sin esto cualquiera puede registrar depósitos.
+      schema: { type: string }
+
+    IdCuenta:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    IdOrden:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+
+  responses:
+    Invalido:
+      description: Cuerpo o parámetros inválidos. No se creó nada ni se tocó el ledger.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NoEncontrado:
+      description: El recurso no existe.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    AdminNoAutorizado:
+      description: Falta la cabecera `X-Admin-Key` o no coincide con `ADMIN_API_KEY`.
+    MockNoAutorizado:
+      description: Falta la cabecera `X-Mock-Key` o no coincide con `MOCK_API_KEY`.
+    Rechazada:
+      description: |
+        Precondición de negocio incumplida (cuenta inactiva, fondos insuficientes, límite
+        superado). La orden queda persistida con su motivo y sus transiciones, pero **no**
+        generó asientos.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Enlaces:
+      type: object
+      additionalProperties: { type: string }
+      example:
+        self: /egresos/3
+        origen: /cuentas/5
+        resolver: /egresos/3
+
+    Error:
+      type: object
+      properties:
+        codigo: { type: string, example: fondos_insuficientes }
+        mensaje: { type: string }
+
+    Cuenta:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        alias: { type: string }
+        tipo: { type: string, enum: [usuario, comercio, interna] }
+        activa: { type: boolean }
+        creada_en: { type: string, format: date-time }
+        _links: { $ref: '#/components/schemas/Enlaces' }
+
+    CuentaDetalle:
+      allOf:
+        - $ref: '#/components/schemas/Cuenta'
+        - type: object
+          properties:
+            permite_negativo:
+              type: boolean
+              description: |
+                Sólo las cuentas internas. Su saldo negativo es dinero en tránsito, no un
+                descubierto; por eso la validación de fondos vive en la aplicación y no en
+                un CHECK sobre la tabla de saldos.
+            saldo_centavos: { type: integer, format: int64 }
+            limite_por_operacion_centavos: { type: integer, format: int64 }
+            operaciones_ultimo_mes: { type: integer, format: int64 }
+
+    Orden:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        tipo: { type: string, enum: [transferencia, egreso, ingreso] }
+        estado:
+          type: string
+          enum: [pendiente, liquidada, rechazada, reservada, enviada, acreditada, devuelta, en_duda, atribuida, no_atribuida]
+        referencia: { type: string }
+        origen_id: { type: integer, format: int64 }
+        destino_id: { type: integer, format: int64 }
+        cbu_destino: { type: string }
+        monto_centavos: { type: integer, format: int64 }
+        motivo: { type: string }
+        creada_en: { type: string, format: date-time }
+        actualizada_en: { type: string, format: date-time }
+        _links: { $ref: '#/components/schemas/Enlaces' }
+
+    Movimiento:
+      type: object
+      properties:
+        periodo: { type: string, format: date }
+        orden_id: { type: integer, format: int64 }
+        contraparte_id: { type: integer, format: int64 }
+        monto_centavos:
+          type: integer
+          format: int64
+          description: Negativo débito, positivo crédito. La suma de los asientos de una orden es 0.
+        tramo:
+          type: string
+          description: Qué paso de la operación asienta esta fila. Discrimina los pares de una misma orden.
+        creado_en: { type: string, format: date-time }
+
+    ExtractoPeriodo:
+      type: object
+      properties:
+        cuenta_id: { type: integer, format: int64 }
+        periodo: { type: string, example: "2026-06" }
+        origen:
+          type: string
+          enum: [base, archivo]
+          description: De dónde salieron los movimientos.
+        objeto:
+          type: string
+          description: Clave del objeto en S3. Sólo cuando `origen` es `archivo`.
+        movimientos:
+          type: array
+          items: { $ref: '#/components/schemas/Movimiento' }
+        _links: { $ref: '#/components/schemas/Enlaces' }
+
+    Exportacion:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        cuenta_id: { type: integer, format: int64 }
+        desde: { type: string, example: "2026-01" }
+        hasta: { type: string, example: "2026-06" }
+        estado: { type: string, enum: [pendiente, lista, fallida] }
+        objeto: { type: string }
+        uri: { type: string }
+        filas: { type: integer, format: int64 }
+        periodos_base:
+          type: integer
+          description: Cuántos períodos del rango salieron de la base.
+        periodos_archivo:
+          type: integer
+          description: Cuántos salieron del archivo en S3.
+        motivo: { type: string }
+        solicitada_en: { type: string, format: date-time }
+        resuelta_en: { type: string, format: date-time }
+        _links: { $ref: '#/components/schemas/Enlaces' }

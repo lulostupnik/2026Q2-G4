@@ -1,0 +1,78 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Escribir "deploy" para confirmar'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+  TF_VERSION: 1.16.6
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+  AWS_REGION: us-east-1
+  TF_VAR_proveedor_url: ${{ vars.PROVEEDOR_URL }}
+  TF_VAR_proveedor_api_key: ${{ secrets.PROVEEDOR_API_KEY }}
+  TF_VAR_mock_api_key: ${{ secrets.MOCK_API_KEY }}
+  TF_VAR_webhook_url: ${{ vars.WEBHOOK_URL }}
+  TF_VAR_webhook_secret: ${{ secrets.WEBHOOK_SECRET }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: imagen + plan + apply
+    runs-on: ubuntu-latest
+    if: inputs.confirm == 'deploy'
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Verificar credenciales
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "::error::Faltan los secrets AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y AWS_SESSION_TOKEN."
+            exit 1
+          fi
+          aws sts get-caller-identity --query Arn --output text
+
+      - name: imagen
+        run: make imagen
+
+      - name: plan
+        run: make plan
+
+      - name: apply
+        run: make apply
+
+      - name: Resumen
+        working-directory: terraform/organization
+        run: |
+          {
+            echo '### Deploy'
+            echo
+            echo '| Output | Valor |'
+            echo '|---|---|'
+            echo "| \`website_url\` | $(terraform output -raw website_url) |"
+            echo "| \`api_url\` | $(terraform output -raw api_url) |"
+            echo "| \`login_url\` | $(terraform output -json cognito | jq -r .login_url) |"
+            echo "| \`bucket_name\` | \`$(terraform output -raw bucket_name)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

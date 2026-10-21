@@ -1,0 +1,12 @@
+# Copiar a terraform.tfvars y ajustar. terraform.tfvars NO se commitea (.gitignore).
+# Todas las variables tienen default: sin este archivo el apply funciona igual.
+
+# project_name          = "ledger"
+# aws_region            = "us-east-1"
+# vpc_cidr              = "10.0.0.0/16"
+# api_instance_type     = "c7g.large"
+# archive_instance_type = "t3.micro"
+
+# db_instance_class  = "db.t3.micro"
+# db_multi_az        = false # para probar: el apply tarda la mitad
+# db_max_connections = 60
