@@ -216,3 +216,50 @@ func TestDelEncabezado(t *testing.T) {
 		}
 	}
 }
+
+func (p *pool) tokenID(t *testing.T, cambios map[string]any) string {
+	claims := map[string]any{
+		"sub":            "1b2c3d4e",
+		"iss":            p.servidor.URL,
+		"exp":            time.Now().Add(time.Hour).Unix(),
+		"token_use":      "id",
+		"aud":            clientID,
+		"email":          "ana@example.com",
+		"email_verified": true,
+	}
+	for k, v := range cambios {
+		claims[k] = v
+	}
+	return p.firmar(t, map[string]any{"alg": "RS256", "kid": "k1"}, claims, p.clave)
+}
+
+func TestIDTokenDaElEmail(t *testing.T) {
+	p := nuevoPool(t)
+	for _, verificado := range []any{true, "true"} {
+		id, err := p.validador().ValidarID(context.Background(), p.tokenID(t, map[string]any{"email_verified": verificado}))
+		if err != nil {
+			t.Fatalf("validar con email_verified=%v: %v", verificado, err)
+		}
+		if id.Sub != "1b2c3d4e" || id.Email != "ana@example.com" {
+			t.Fatalf("identidad inesperada: %+v", id)
+		}
+	}
+}
+
+func TestIDTokenQueNoCorresponde(t *testing.T) {
+	p := nuevoPool(t)
+	casos := map[string]map[string]any{
+		"access token":        {"token_use": "access"},
+		"otro app client":     {"aud": "otro"},
+		"sin email":           {"email": ""},
+		"email sin verificar": {"email_verified": false},
+	}
+	for nombre, cambios := range casos {
+		if _, err := p.validador().ValidarID(context.Background(), p.tokenID(t, cambios)); !errors.Is(err, ErrInvalido) {
+			t.Errorf("%s: deberia ser invalido, dio %v", nombre, err)
+		}
+	}
+	if _, err := p.validador().Validar(context.Background(), p.tokenID(t, nil)); !errors.Is(err, ErrInvalido) {
+		t.Errorf("un id token no puede servir como sesion, dio %v", err)
+	}
+}

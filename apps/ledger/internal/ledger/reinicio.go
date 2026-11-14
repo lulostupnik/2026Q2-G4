@@ -30,6 +30,7 @@ var tablasDeDatos = []string{
 
 	"ordenes",
 
+	"archivo_partes",
 	"periodos_archivados",
 	"avisos_recibidos",
 	"tareas",

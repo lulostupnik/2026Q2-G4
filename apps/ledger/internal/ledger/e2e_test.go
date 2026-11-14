@@ -3,6 +3,7 @@ package ledger_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"testing"
@@ -156,6 +157,78 @@ func TestArchivadoConservaElExtractoYElSaldo(t *testing.T) {
 	}
 }
 
+func TestArchivadoEnVariasPartesConservaCadaExtracto(t *testing.T) {
+	svc, arch, pool := entorno(t)
+	ctx := context.Background()
+	arch.ConPartes(6, 4, 3)
+
+	var cuentas []int64
+	for _, alias := range []string{"ana", "beto", "caro", "dani", "eli", "fede"} {
+		c, err := svc.CrearCuenta(ctx, ledger.EntradaCuenta{Alias: alias, Tipo: "usuario", SaldoInicialCentavos: 100000})
+		if err != nil {
+			t.Fatalf("crear %s: %v", alias, err)
+		}
+		cuentas = append(cuentas, c.ID)
+	}
+	etiqueta := periodoViejo.Format("2006-01")
+	for i, origen := range cuentas {
+		if _, err := svc.SembrarPeriodo(ctx, ledger.EntradaSemilla{
+			Periodo: etiqueta, OrigenID: origen, DestinoID: cuentas[(i+1)%len(cuentas)],
+			Cantidad: i + 1, MontoCentavos: int64(100 * (i + 1)),
+		}); err != nil {
+			t.Fatalf("sembrar: %v", err)
+		}
+	}
+
+	antes := map[int64][]ledger.Movimiento{}
+	for _, c := range cuentas {
+		e, err := svc.MovimientosDePeriodo(ctx, c, periodoViejo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		antes[c] = e.Movimientos
+	}
+
+	if _, err := arch.Agendar(ctx); err != nil {
+		t.Fatalf("agendar: %v", err)
+	}
+	res, err := arch.Ciclo(ctx)
+	if err != nil {
+		t.Fatalf("ciclo: %v", err)
+	}
+	if res == nil || res.Partes < 2 {
+		t.Fatalf("el mes tendria que quedar en varias partes: %+v", res)
+	}
+
+	var solapadas int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM archivo_partes a JOIN archivo_partes b
+		  ON a.periodo = b.periodo AND a.parte < b.parte AND a.cuenta_max >= b.cuenta_min`).Scan(&solapadas); err != nil {
+		t.Fatal(err)
+	}
+	if solapadas != 0 {
+		t.Fatalf("hay %d pares de partes con cuentas en comun: una cuenta tiene que quedar en una sola parte", solapadas)
+	}
+
+	for _, c := range cuentas {
+		e, err := svc.MovimientosDePeriodo(ctx, c, periodoViejo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e.Origen != ledger.OrigenArchivo {
+			t.Fatalf("cuenta %d: origen %q", c, e.Origen)
+		}
+		if len(e.Movimientos) != len(antes[c]) {
+			t.Fatalf("cuenta %d: %d movimientos en el archivo y %d en la base", c, len(e.Movimientos), len(antes[c]))
+		}
+		for i := range e.Movimientos {
+			if !mismoMovimiento(e.Movimientos[i], antes[c][i]) {
+				t.Errorf("cuenta %d, movimiento %d cambio:\n  base    %+v\n  archivo %+v", c, i, antes[c][i], e.Movimientos[i])
+			}
+		}
+	}
+}
+
 func TestExportacionContableDistingueLasCuentas(t *testing.T) {
 	svc, _, _ := entorno(t)
 	ctx := context.Background()
@@ -175,12 +248,35 @@ func TestExportacionContableDistingueLasCuentas(t *testing.T) {
 	}
 
 	mes := pg.InicioDeMes(time.Now()).Format("2006-01")
-	exp, err := svc.Exportar(ctx, ledger.EntradaExportacion{Desde: mes, Hasta: mes})
+	pedida, err := svc.Exportar(ctx, ledger.EntradaExportacion{Desde: mes, Hasta: mes})
 	if err != nil {
 		t.Fatalf("exportar: %v", err)
 	}
+	if pedida.Estado != ledger.ExportPendiente {
+		t.Fatalf("recien pedida tendria que estar %q, esta %q", ledger.ExportPendiente, pedida.Estado)
+	}
+	if _, err := svc.DescargarExportacion(ctx, pedida); err == nil {
+		t.Fatal("una exportacion pendiente no se puede descargar")
+	}
+	if hubo, err := svc.ResolverExportacionPendiente(ctx); err != nil || !hubo {
+		t.Fatalf("resolver: hubo=%v, %v", hubo, err)
+	}
+	if hubo, err := svc.ResolverExportacionPendiente(ctx); err != nil || hubo {
+		t.Fatalf("no tendria que quedar otra pendiente: hubo=%v, %v", hubo, err)
+	}
+	exp, err := svc.VerExportacion(ctx, pedida.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if exp.Estado != ledger.ExportLista {
 		t.Fatalf("estado %q, se queria %q", exp.Estado, ledger.ExportLista)
+	}
+	descarga, err := svc.DescargarExportacion(ctx, exp)
+	if err != nil {
+		t.Fatalf("descargar: %v", err)
+	}
+	if descarga.URL == "" || !descarga.VenceEn.After(time.Now()) {
+		t.Fatalf("descarga inesperada: %+v", descarga)
 	}
 	if exp.Filas == nil || *exp.Filas == 0 {
 		t.Fatal("la exportacion salio vacia")
@@ -246,12 +342,12 @@ type almacenQueFalla struct {
 	fallas int
 }
 
-func (a *almacenQueFalla) Guardar(ctx context.Context, clave string, cuerpo []byte, tipo string) (string, error) {
+func (a *almacenQueFalla) Subir(ctx context.Context, clave, tipo string, escribir func(io.Writer) error) (objetos.Subido, error) {
 	if a.fallas > 0 {
 		a.fallas--
-		return "", errors.New("PUT cortado")
+		return objetos.Subido{}, errors.New("PUT cortado")
 	}
-	return a.Almacen.Guardar(ctx, clave, cuerpo, tipo)
+	return a.Almacen.Subir(ctx, clave, tipo, escribir)
 }
 
 func TestArchivadoSeRecuperaSiFallaLaExportacion(t *testing.T) {

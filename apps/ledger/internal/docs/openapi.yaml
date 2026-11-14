@@ -172,7 +172,17 @@ paths:
         elige. **Se asienta contra la cuenta interna de ajustes**, de modo que el ledger sigue
         balanceado: no aparece dinero de la nada, aparece un ajuste explícito y auditable. En
         producción el saldo entra por `/ingresos`.
+
+        Si viene `X-Id-Token` (el ID token de Cognito del mismo usuario, con el email
+        verificado), el email del titular se suscribe a sus avisos por mail. AWS le manda un
+        mail para confirmar la suscripción; hasta que la confirme, no recibe avisos.
       operationId: crearCuenta
+      parameters:
+        - in: header
+          name: X-Id-Token
+          required: false
+          schema: { type: string }
+          description: ID token de Cognito, para suscribir el email del titular a sus avisos.
       requestBody:
         required: true
         content:
@@ -479,8 +489,13 @@ paths:
       tags: [historico]
       summary: Exportar el histórico de un rango de meses
       description: |
-        Registra la solicitud y **la resuelve dentro del mismo request**, cruzando períodos
-        que están en línea con períodos ya archivados. El rango se acota a 24 meses.
+        Registra la solicitud y responde enseguida con la exportación `pendiente`. La arma un
+        proceso en segundo plano, que cruza períodos que están en línea con períodos ya
+        archivados y deja el archivo en S3. El rango se acota a 24 meses.
+
+        Cuando queda `lista`, si la exportación es de una cuenta con titular suscripto, el
+        titular recibe un mail que avisa que está lista, con el link a la app (no al archivo).
+        Se descarga con `GET /exportaciones/{id}/descarga`.
       operationId: exportar
       requestBody:
         required: true
@@ -497,8 +512,8 @@ paths:
                 desde: { type: string, pattern: '^\d{4}-\d{2}$', example: "2026-01" }
                 hasta: { type: string, pattern: '^\d{4}-\d{2}$', example: "2026-06" }
       responses:
-        '201':
-          description: Resuelta.
+        '202':
+          description: Registrada; queda pendiente hasta que se arma el archivo.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Exportacion' }
@@ -509,7 +524,7 @@ paths:
     parameters: [{ $ref: '#/components/parameters/IdOrden' }]
     get:
       tags: [historico]
-      summary: Resultado de una exportación ya hecha
+      summary: Estado de una exportación
       operationId: verExportacion
       responses:
         '200':
@@ -518,6 +533,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Exportacion' }
         '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /exportaciones/{id}/descarga:
+    parameters: [{ $ref: '#/components/parameters/IdOrden' }]
+    get:
+      tags: [historico]
+      summary: Link para descargar una exportación lista
+      description: |
+        Devuelve una URL prefirmada de S3, por HTTPS, que vence a los 15 minutos. El archivo
+        se baja directo de S3, sin pasar por la API. Cada pedido firma una URL nueva: lo que dura
+        días es el archivo, no el link.
+      operationId: descargarExportacion
+      responses:
+        '200':
+          description: URL de descarga.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string, format: uri }
+                  vence_en: { type: string, format: date-time }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409': { description: La exportación todavía no está lista o falló. }
+        '410': { description: El archivo ya venció; hay que pedir la exportación de nuevo. }
 
   /admin/cierre:
     post:

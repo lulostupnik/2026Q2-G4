@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"ledger/db"
+	"ledger/internal/avisos"
 	"ledger/internal/config"
 	"ledger/internal/cors"
 	"ledger/internal/ledger"
@@ -95,11 +96,23 @@ func correr() error {
 
 	receptor := webhook.NuevoReceptor(pool, cfg.WebhookSecreto)
 
+	titulares, err := avisos.Nuevo(arranque, cfg.Region, cfg.TitularesTopicARN)
+	if err != nil {
+		return err
+	}
+	if titulares.Habilitado() {
+		slog.Info("avisos a titulares habilitados", "topic", titulares.Topic())
+	} else {
+		slog.Warn("sin TITULARES_TOPIC_ARN: no se avisa a los titulares por mail")
+	}
+
 	prov := proveedor.NuevoConClave(cfg.ProveedorURL, cfg.ProveedorTimeout, cfg.ProveedorClave)
 	svc, err := ledger.Nuevo(arranque, pool, prov, alm, notif, cfg.ConciliacionIntervalo, cfg.ProveedorURL)
 	if err != nil {
 		return err
 	}
+	svc.ConAvisos(titulares, cfg.AppURL)
+	go svc.AtenderExportaciones(ctx)
 
 	simulado := mock.Nuevo(pool, mock.Opciones{
 		Clave: cfg.MockClave, DemoraSinRespuesta: cfg.MockDemoraSinRespuesta})
@@ -130,7 +143,7 @@ func correr() error {
 
 	api := &API{
 		svc: svc, pool: pool, mock: simulado, cors: politica,
-		sesiones: sesiones, avisos: receptor, adminClave: cfg.AdminClave,
+		sesiones: sesiones, avisos: receptor, titulares: titulares, adminClave: cfg.AdminClave,
 		bienvenida: cfg.Bienvenida,
 		secretos: Secretos{
 			Mock: cfg.MockClave, Proveedor: cfg.ProveedorClave,

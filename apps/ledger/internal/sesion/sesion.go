@@ -56,66 +56,117 @@ type cabecera struct {
 }
 
 type cuerpo struct {
-	Sub      string `json:"sub"`
-	Iss      string `json:"iss"`
-	Exp      int64  `json:"exp"`
-	TokenUse string `json:"token_use"`
-	ClientID string `json:"client_id"`
+	Sub           string      `json:"sub"`
+	Iss           string      `json:"iss"`
+	Exp           int64       `json:"exp"`
+	TokenUse      string      `json:"token_use"`
+	ClientID      string      `json:"client_id"`
+	Aud           string      `json:"aud"`
+	Email         string      `json:"email"`
+	EmailVerified booleanoJWT `json:"email_verified"`
+}
+
+type booleanoJWT bool
+
+func (b *booleanoJWT) UnmarshalJSON(datos []byte) error {
+	var v any
+	if err := json.Unmarshal(datos, &v); err != nil {
+		return err
+	}
+	switch x := v.(type) {
+	case bool:
+		*b = booleanoJWT(x)
+	case string:
+		*b = booleanoJWT(x == "true")
+	}
+	return nil
+}
+
+type IdentidadID struct {
+	Sub   string
+	Email string
 }
 
 func (v *Validador) Validar(ctx context.Context, token string) (Identidad, error) {
-	if !v.Habilitado() {
-		return Identidad{}, errors.New("faltan COGNITO_ISSUER y COGNITO_CLIENT_ID: no se pueden validar sesiones")
-	}
-
-	partes := strings.Split(token, ".")
-	if len(partes) != 3 {
-		return Identidad{}, fmt.Errorf("%w: no tiene tres partes", ErrInvalido)
-	}
-
-	var cab cabecera
-	if err := decodificarJSON(partes[0], &cab); err != nil {
-		return Identidad{}, fmt.Errorf("%w: cabecera ilegible", ErrInvalido)
-	}
-	if cab.Alg != "RS256" {
-		return Identidad{}, fmt.Errorf("%w: alg %q no es RS256", ErrInvalido, cab.Alg)
-	}
-
-	firma, err := base64.RawURLEncoding.DecodeString(partes[2])
-	if err != nil {
-		return Identidad{}, fmt.Errorf("%w: firma ilegible", ErrInvalido)
-	}
-	clave, err := v.clave(ctx, cab.Kid)
+	c, err := v.verificar(ctx, token)
 	if err != nil {
 		return Identidad{}, err
 	}
-	suma := sha256.Sum256([]byte(partes[0] + "." + partes[1]))
-	if err := rsa.VerifyPKCS1v15(clave, crypto.SHA256, suma[:], firma); err != nil {
-		return Identidad{}, fmt.Errorf("%w: la firma no coincide", ErrInvalido)
-	}
-
-	var c cuerpo
-	if err := decodificarJSON(partes[1], &c); err != nil {
-		return Identidad{}, fmt.Errorf("%w: cuerpo ilegible", ErrInvalido)
-	}
 	switch {
-	case c.Iss != v.issuer:
-		return Identidad{}, fmt.Errorf("%w: iss %q no es el del user pool", ErrInvalido, c.Iss)
 	case c.TokenUse != "access":
 		return Identidad{}, fmt.Errorf("%w: token_use %q no es access", ErrInvalido, c.TokenUse)
 	case c.ClientID != v.clientID:
 		return Identidad{}, fmt.Errorf("%w: client_id %q no es el del app client", ErrInvalido, c.ClientID)
-	case c.Sub == "":
-		return Identidad{}, fmt.Errorf("%w: no tiene sub", ErrInvalido)
-	case c.Exp <= 0:
-		return Identidad{}, fmt.Errorf("%w: no tiene exp", ErrInvalido)
+	}
+	return Identidad{Sub: c.Sub, Expira: time.Unix(c.Exp, 0)}, nil
+}
+
+func (v *Validador) ValidarID(ctx context.Context, token string) (IdentidadID, error) {
+	c, err := v.verificar(ctx, token)
+	if err != nil {
+		return IdentidadID{}, err
+	}
+	switch {
+	case c.TokenUse != "id":
+		return IdentidadID{}, fmt.Errorf("%w: token_use %q no es id", ErrInvalido, c.TokenUse)
+	case c.Aud != v.clientID:
+		return IdentidadID{}, fmt.Errorf("%w: aud %q no es el del app client", ErrInvalido, c.Aud)
+	case c.Email == "":
+		return IdentidadID{}, fmt.Errorf("%w: no tiene email", ErrInvalido)
+	case !bool(c.EmailVerified):
+		return IdentidadID{}, fmt.Errorf("%w: el email no esta verificado", ErrInvalido)
+	}
+	return IdentidadID{Sub: c.Sub, Email: c.Email}, nil
+}
+
+func (v *Validador) verificar(ctx context.Context, token string) (cuerpo, error) {
+	if !v.Habilitado() {
+		return cuerpo{}, errors.New("faltan COGNITO_ISSUER y COGNITO_CLIENT_ID: no se pueden validar sesiones")
 	}
 
-	expira := time.Unix(c.Exp, 0)
-	if time.Now().After(expira) {
-		return Identidad{}, ErrVencido
+	partes := strings.Split(token, ".")
+	if len(partes) != 3 {
+		return cuerpo{}, fmt.Errorf("%w: no tiene tres partes", ErrInvalido)
 	}
-	return Identidad{Sub: c.Sub, Expira: expira}, nil
+
+	var cab cabecera
+	if err := decodificarJSON(partes[0], &cab); err != nil {
+		return cuerpo{}, fmt.Errorf("%w: cabecera ilegible", ErrInvalido)
+	}
+	if cab.Alg != "RS256" {
+		return cuerpo{}, fmt.Errorf("%w: alg %q no es RS256", ErrInvalido, cab.Alg)
+	}
+
+	firma, err := base64.RawURLEncoding.DecodeString(partes[2])
+	if err != nil {
+		return cuerpo{}, fmt.Errorf("%w: firma ilegible", ErrInvalido)
+	}
+	clave, err := v.clave(ctx, cab.Kid)
+	if err != nil {
+		return cuerpo{}, err
+	}
+	suma := sha256.Sum256([]byte(partes[0] + "." + partes[1]))
+	if err := rsa.VerifyPKCS1v15(clave, crypto.SHA256, suma[:], firma); err != nil {
+		return cuerpo{}, fmt.Errorf("%w: la firma no coincide", ErrInvalido)
+	}
+
+	var c cuerpo
+	if err := decodificarJSON(partes[1], &c); err != nil {
+		return cuerpo{}, fmt.Errorf("%w: cuerpo ilegible", ErrInvalido)
+	}
+	switch {
+	case c.Iss != v.issuer:
+		return cuerpo{}, fmt.Errorf("%w: iss %q no es el del user pool", ErrInvalido, c.Iss)
+	case c.Sub == "":
+		return cuerpo{}, fmt.Errorf("%w: no tiene sub", ErrInvalido)
+	case c.Exp <= 0:
+		return cuerpo{}, fmt.Errorf("%w: no tiene exp", ErrInvalido)
+	}
+
+	if time.Now().After(time.Unix(c.Exp, 0)) {
+		return cuerpo{}, ErrVencido
+	}
+	return c, nil
 }
 
 func (v *Validador) clave(ctx context.Context, kid string) (*rsa.PublicKey, error) {

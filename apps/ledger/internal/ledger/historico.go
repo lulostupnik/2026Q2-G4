@@ -1,13 +1,10 @@
 package ledger
 
 import (
-	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -39,6 +36,16 @@ type fuentePeriodo struct {
 }
 
 func (s *Servicio) asientosDePeriodo(ctx context.Context, cuenta *int64, periodo time.Time) (fuentePeriodo, error) {
+	fuente := fuentePeriodo{Movimientos: []Movimiento{}}
+	origen, clave, err := s.recorrerPeriodo(ctx, cuenta, periodo, func(m Movimiento) error {
+		fuente.Movimientos = append(fuente.Movimientos, m)
+		return nil
+	})
+	fuente.Origen, fuente.Clave = origen, clave
+	return fuente, err
+}
+
+func (s *Servicio) recorrerPeriodo(ctx context.Context, cuenta *int64, periodo time.Time, fn func(Movimiento) error) (string, string, error) {
 	etiqueta := periodo.Format("2006-01")
 
 	var clave *string
@@ -47,30 +54,77 @@ func (s *Servicio) asientosDePeriodo(ctx context.Context, cuenta *int64, periodo
 		`SELECT clave, filas FROM periodos_archivados WHERE periodo = $1`, periodo).Scan(&clave, &filas)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-
-		movs, err := s.asientosDeBase(ctx, cuenta, periodo)
-		return fuentePeriodo{Movimientos: movs, Origen: OrigenBase}, err
+		return OrigenBase, "", s.recorrerBase(ctx, cuenta, periodo, fn)
 	case err != nil:
-		return fuentePeriodo{}, err
+		return "", "", err
 	}
 
 	if clave == nil {
-		return fuentePeriodo{}, apierr.New(http.StatusServiceUnavailable, "archivado_en_curso",
+		return "", "", apierr.New(http.StatusServiceUnavailable, "archivado_en_curso",
 			"el periodo %s se esta archivando: reintentá en unos minutos", etiqueta)
 	}
-
-	fuente := fuentePeriodo{Movimientos: []Movimiento{}, Origen: OrigenArchivo, Clave: *clave}
-
 	if filas != nil && *filas == 0 {
-		return fuente, nil
+		return OrigenArchivo, *clave, nil
 	}
 
-	movs, err := s.leerDelArchivo(ctx, *clave, cuenta, etiqueta)
+	partes, err := s.partesDelArchivo(ctx, periodo, cuenta)
 	if err != nil {
-		return fuentePeriodo{}, err
+		return "", "", err
 	}
-	fuente.Movimientos = movs
-	return fuente, nil
+	objeto := *clave
+	if cuenta != nil && len(partes) == 1 {
+		objeto = partes[0].clave
+	}
+
+	for _, p := range partes {
+		lectura, err := s.lector.Recorrer(ctx, p.clave, p.bytes, cuenta, func(f archivado.Fila) error {
+			return fn(Movimiento{
+				Periodo:       periodo,
+				CuentaID:      f.CuentaID,
+				OrdenID:       f.OrdenID,
+				ContraparteID: f.ContraparteID,
+				MontoCentavos: f.MontoCentavos,
+				Tramo:         f.Tramo,
+				CreadoEn:      f.CreadoEn,
+			})
+		})
+		if errors.Is(err, objetos.ErrNoExiste) {
+			return "", "", fmt.Errorf("el periodo %s figura archivado en %s pero el objeto no esta", etiqueta, p.clave)
+		}
+		if err != nil {
+			return "", "", err
+		}
+		slog.Info("lectura del archivo", "objeto", p.clave, "bytes", p.bytes,
+			"bloques", lectura.Bloques, "bloques_leidos", lectura.BloquesLeidos, "pedidos_s3", lectura.Pedidos,
+			"bytes_leidos", lectura.Bytes)
+	}
+	return OrigenArchivo, objeto, nil
+}
+
+type parteArchivo struct {
+	clave string
+	bytes int64
+}
+
+func (s *Servicio) partesDelArchivo(ctx context.Context, periodo time.Time, cuenta *int64) ([]parteArchivo, error) {
+	filas, err := s.pool.Query(ctx, `
+		SELECT clave, bytes FROM archivo_partes
+		WHERE periodo = $1 AND ($2::bigint IS NULL OR $2 BETWEEN cuenta_min AND cuenta_max)
+		ORDER BY parte`, periodo, cuenta)
+	if err != nil {
+		return nil, err
+	}
+	defer filas.Close()
+
+	var partes []parteArchivo
+	for filas.Next() {
+		var p parteArchivo
+		if err := filas.Scan(&p.clave, &p.bytes); err != nil {
+			return nil, err
+		}
+		partes = append(partes, p)
+	}
+	return partes, filas.Err()
 }
 
 func (s *Servicio) MovimientosDePeriodo(ctx context.Context, cuentaID int64, periodo time.Time) (*ExtractoPeriodo, error) {
@@ -98,70 +152,25 @@ func (s *Servicio) MovimientosDePeriodo(ctx context.Context, cuentaID int64, per
 	}, nil
 }
 
-func (s *Servicio) leerDelArchivo(ctx context.Context, clave string, cuenta *int64, etiqueta string) ([]Movimiento, error) {
-	crudo, err := s.obj.Leer(ctx, clave)
-	if errors.Is(err, objetos.ErrNoExiste) {
-
-		return nil, fmt.Errorf("el periodo %s figura archivado en %s pero el objeto no esta", etiqueta, clave)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	descomprimido, err := gzip.NewReader(bytes.NewReader(crudo))
-	if err != nil {
-		return nil, fmt.Errorf("descomprimir %s: %w", clave, err)
-	}
-	defer descomprimido.Close()
-
-	movs := []Movimiento{}
-	lector := bufio.NewScanner(descomprimido)
-
-	lector.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for lector.Scan() {
-		linea := lector.Bytes()
-		if len(linea) == 0 {
-			continue
-		}
-		var a archivado.Asiento
-		if err := json.Unmarshal(linea, &a); err != nil {
-			return nil, fmt.Errorf("linea invalida en %s: %w", clave, err)
-		}
-		if cuenta != nil && a.CuentaID != *cuenta {
-			continue
-		}
-		periodo, _ := time.Parse("2006-01-02", a.Periodo)
-		movs = append(movs, Movimiento{
-			Periodo:       periodo,
-			CuentaID:      a.CuentaID,
-			OrdenID:       a.OrdenID,
-			ContraparteID: a.ContraparteID,
-			MontoCentavos: a.MontoCentavos,
-			Tramo:         a.Tramo,
-			CreadoEn:      a.CreadoEn,
-		})
-	}
-	return movs, lector.Err()
-}
-
-func (s *Servicio) asientosDeBase(ctx context.Context, cuenta *int64, periodo time.Time) ([]Movimiento, error) {
+func (s *Servicio) recorrerBase(ctx context.Context, cuenta *int64, periodo time.Time, fn func(Movimiento) error) error {
 	filas, err := s.pool.Query(ctx, `
 		SELECT periodo, cuenta_id, orden_id, contraparte_id, monto_centavos, tramo, creado_en
 		FROM asientos
 		WHERE periodo = $1 AND ($2::bigint IS NULL OR cuenta_id = $2)
 		ORDER BY cuenta_id, creado_en, id`, periodo, cuenta)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer filas.Close()
 
-	movs := []Movimiento{}
 	for filas.Next() {
 		var m Movimiento
 		if err := filas.Scan(&m.Periodo, &m.CuentaID, &m.OrdenID, &m.ContraparteID, &m.MontoCentavos, &m.Tramo, &m.CreadoEn); err != nil {
-			return nil, err
+			return err
 		}
-		movs = append(movs, m)
+		if err := fn(m); err != nil {
+			return err
+		}
 	}
-	return movs, filas.Err()
+	return filas.Err()
 }

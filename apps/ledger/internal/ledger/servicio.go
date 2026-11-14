@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"ledger/internal/apierr"
+	"ledger/internal/archivado"
+	"ledger/internal/avisos"
 	"ledger/internal/objetos"
 	"ledger/internal/pg"
 	"ledger/internal/proveedor"
@@ -56,9 +58,10 @@ const (
 var errReintento = errors.New("orden ya registrada con esa clave de idempotencia")
 
 type Servicio struct {
-	pool *pgxpool.Pool
-	prov *proveedor.Cliente
-	obj  objetos.Almacen
+	pool   *pgxpool.Pool
+	prov   *proveedor.Cliente
+	obj    objetos.Almacen
+	lector *archivado.Lector
 
 	proveedorPorDefecto string
 	notif               *webhook.Notificador
@@ -67,6 +70,10 @@ type Servicio struct {
 	internasPorID map[int64]bool
 
 	conciliacionIntervalo time.Duration
+
+	exportaciones chan struct{}
+	avisos        *avisos.Avisador
+	appURL        string
 }
 
 func Nuevo(ctx context.Context, pool *pgxpool.Pool, prov *proveedor.Cliente, obj objetos.Almacen, notif *webhook.Notificador, conciliacionIntervalo time.Duration, proveedorPorDefecto string) (*Servicio, error) {
@@ -74,11 +81,13 @@ func Nuevo(ctx context.Context, pool *pgxpool.Pool, prov *proveedor.Cliente, obj
 		pool:                  pool,
 		prov:                  prov,
 		obj:                   obj,
+		lector:                archivado.NuevoLector(obj),
 		proveedorPorDefecto:   proveedorPorDefecto,
 		notif:                 notif,
 		internas:              map[string]int64{},
 		internasPorID:         map[int64]bool{},
 		conciliacionIntervalo: conciliacionIntervalo,
+		exportaciones:         make(chan struct{}, 1),
 	}
 
 	filas, err := pool.Query(ctx, `SELECT alias, id FROM cuentas WHERE tipo = 'interna'`)
@@ -104,6 +113,11 @@ func Nuevo(ctx context.Context, pool *pgxpool.Pool, prov *proveedor.Cliente, obj
 		}
 	}
 	return s, nil
+}
+
+func (s *Servicio) ConAvisos(a *avisos.Avisador, appURL string) *Servicio {
+	s.avisos, s.appURL = a, appURL
+	return s
 }
 
 func (s *Servicio) interna(alias string) int64 { return s.internas[alias] }

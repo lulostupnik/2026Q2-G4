@@ -53,10 +53,12 @@ func correr() error {
 	if err != nil {
 		return err
 	}
-	arch := archivado.Nuevo(pool, alm, cfg.RetencionMeses)
+	arch := archivado.Nuevo(pool, alm, cfg.RetencionMeses).
+		ConPartes(cfg.FilasPorParte, cfg.FilasPorBloque, cfg.Paralelismo)
 
 	slog.Info("archivador en marcha",
-		"intervalo", cfg.ArchivadoIntervalo.String(), "retencion_meses", cfg.RetencionMeses)
+		"intervalo", cfg.ArchivadoIntervalo.String(), "retencion_meses", cfg.RetencionMeses,
+		"filas_por_parte", cfg.FilasPorParte, "filas_por_bloque", cfg.FilasPorBloque, "paralelismo", cfg.Paralelismo)
 
 	tic := time.NewTicker(cfg.ArchivadoIntervalo)
 	defer tic.Stop()
@@ -93,7 +95,7 @@ func correr() error {
 			}
 			slog.Info("archivado",
 				"periodo", res.Periodo, "particion", res.Particion, "filas", res.Filas,
-				"suma_centavos", res.SumaCentavos, "objeto", res.Objeto,
+				"suma_centavos", res.SumaCentavos, "objeto", res.Objeto, "partes", res.Partes,
 				"reprogramada", res.Reprogramada, "motivo", res.Motivo)
 		}
 	}

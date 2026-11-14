@@ -130,6 +130,7 @@ func conEnlacesExportacion(e *ledger.Exportacion) exportacionConEnlaces {
 	}
 	if e.Estado == ledger.ExportLista && e.URI != "" {
 		l["objeto"] = e.URI
+		l["descarga"] = fmt.Sprintf("/exportaciones/%d/descarga", e.ID)
 	}
 	return exportacionConEnlaces{Exportacion: e, Links: l}
 }

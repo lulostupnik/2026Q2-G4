@@ -47,6 +47,13 @@ type Config struct {
 
 	RetencionMeses     int
 	ArchivadoIntervalo time.Duration
+
+	FilasPorParte  int64
+	FilasPorBloque int64
+	Paralelismo    int
+
+	TitularesTopicARN string
+	AppURL            string
 }
 
 func Cargar() (Config, error) {
@@ -74,6 +81,11 @@ func Cargar() (Config, error) {
 		WebhookSecreto:         os.Getenv("WEBHOOK_SECRET"),
 		RetencionMeses:         entero("ARCHIVADO_RETENCION_MESES", 12),
 		ArchivadoIntervalo:     duracion("ARCHIVADO_INTERVALO", 30*time.Second),
+		FilasPorParte:          int64(entero("ARCHIVADO_FILAS_POR_PARTE", 0)),
+		FilasPorBloque:         int64(entero("ARCHIVADO_FILAS_POR_BLOQUE", 0)),
+		Paralelismo:            entero("ARCHIVADO_PARALELISMO", 0),
+		TitularesTopicARN:      os.Getenv("TITULARES_TOPIC_ARN"),
+		AppURL:                 os.Getenv("APP_URL"),
 	}
 	if c.DBURL == "" {
 		return c, fmt.Errorf("falta DB_URL")

@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-const cabecerasPermitidas = "Content-Type, Authorization, Idempotency-Key, X-Admin-Key, X-Mock-Key"
+const cabecerasPermitidas = "Content-Type, Authorization, Idempotency-Key, X-Admin-Key, X-Mock-Key, X-Id-Token"
 
 const metodosPermitidos = "GET, POST, PATCH, DELETE, OPTIONS"
 

@@ -130,7 +130,7 @@ let contador = 0;
 // Nunca lanza por un código HTTP: un 422 es el "no" del negocio y un 202 una operación en duda,
 // y la pantalla tiene que saber mostrar los dos. Sólo lanza si no hubo respuesta.
 export async function pedir(metodo, ruta, opciones = {}) {
-  const { cuerpo, clave, admin, mock, sinSesion } = opciones;
+  const { cuerpo, clave, admin, mock, sinSesion, conIdToken } = opciones;
   const cabeceras = {};
 
   if (admin && !estado.admin) return sinClave(metodo, ruta, 'admin');
@@ -150,6 +150,7 @@ export async function pedir(metodo, ruta, opciones = {}) {
   if (admin) cabeceras['X-Admin-Key'] = estado.admin;
   if (mock) cabeceras['X-Mock-Key'] = estado.mock;
   if (estado.token && !sinSesion) cabeceras.Authorization = `Bearer ${estado.token}`;
+  if (conIdToken && estado.idToken) cabeceras['X-Id-Token'] = estado.idToken;
 
   const arranque = performance.now();
   const id = ++contador;

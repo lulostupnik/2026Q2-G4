@@ -1,16 +1,17 @@
 package archivado
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	"ledger/internal/objetos"
 	"ledger/internal/pg"
@@ -22,18 +23,42 @@ const tipoTarea = "archivado"
 
 const prefijoArchivo = "transaction-history/"
 
-func ClaveDe(periodo string) string {
-	return fmt.Sprintf("%speriodo=%s/asientos.ndjson.gz", prefijoArchivo, periodo)
-}
-
 type Archivador struct {
 	pool           *pgxpool.Pool
 	obj            objetos.Almacen
+	lector         *Lector
 	retencionMeses int
+
+	filasPorParte  int64
+	filasPorBloque int64
+	paralelismo    int
 }
 
+const (
+	FilasPorPartePorDefecto  = 5_000_000
+	FilasPorBloquePorDefecto = 1_000_000
+	ParalelismoPorDefecto    = 2
+)
+
 func Nuevo(pool *pgxpool.Pool, obj objetos.Almacen, retencionMeses int) *Archivador {
-	return &Archivador{pool: pool, obj: obj, retencionMeses: retencionMeses}
+	return &Archivador{
+		pool: pool, obj: obj, lector: NuevoLector(obj), retencionMeses: retencionMeses,
+		filasPorParte: FilasPorPartePorDefecto, filasPorBloque: FilasPorBloquePorDefecto,
+		paralelismo: ParalelismoPorDefecto,
+	}
+}
+
+func (a *Archivador) ConPartes(filasPorParte, filasPorBloque int64, paralelismo int) *Archivador {
+	if filasPorParte > 0 {
+		a.filasPorParte = filasPorParte
+	}
+	if filasPorBloque > 0 {
+		a.filasPorBloque = filasPorBloque
+	}
+	if paralelismo > 0 {
+		a.paralelismo = paralelismo
+	}
+	return a
 }
 
 type Resultado struct {
@@ -43,6 +68,7 @@ type Resultado struct {
 	SumaCentavos int64  `json:"suma_centavos"`
 	Objeto       string `json:"objeto,omitempty"`
 	Clave        string `json:"clave,omitempty"`
+	Partes       int    `json:"partes"`
 	Corte        string `json:"corte"`
 	Reprogramada bool   `json:"reprogramada"`
 	Motivo       string `json:"motivo,omitempty"`
@@ -176,79 +202,109 @@ func (a *Archivador) Ciclo(ctx context.Context) (*Resultado, error) {
 	return res, nil
 }
 
-type Asiento struct {
-	ID            int64     `json:"id"`
-	Periodo       string    `json:"periodo"`
-	OrdenID       int64     `json:"orden_id"`
-	CuentaID      int64     `json:"cuenta_id"`
-	ContraparteID int64     `json:"contraparte_id"`
-	MontoCentavos int64     `json:"monto_centavos"`
-	Tramo         string    `json:"tramo"`
-	CreadoEn      time.Time `json:"creado_en"`
+type rango struct {
+	desde, hasta int64
+	filas        int64
+	suma         int64
+}
+
+type Parte struct {
+	Numero       int
+	Clave        string
+	URI          string
+	CuentaMin    int64
+	CuentaMax    int64
+	Filas        int64
+	SumaCentavos int64
+	Bytes        int64
+}
+
+func (a *Archivador) rangos(ctx context.Context, particion string) ([]rango, error) {
+	filas, err := a.pool.Query(ctx, fmt.Sprintf(
+		`SELECT cuenta_id, count(*), coalesce(sum(monto_centavos), 0)::bigint FROM %s
+		 GROUP BY cuenta_id ORDER BY cuenta_id`, particion))
+	if err != nil {
+		return nil, fmt.Errorf("contar filas por cuenta: %w", err)
+	}
+	defer filas.Close()
+
+	var res []rango
+	var actual *rango
+	for filas.Next() {
+		var cuenta, n, suma int64
+		if err := filas.Scan(&cuenta, &n, &suma); err != nil {
+			return nil, err
+		}
+		if actual == nil {
+			res = append(res, rango{desde: cuenta})
+			actual = &res[len(res)-1]
+		}
+		actual.hasta = cuenta
+		actual.filas += n
+		actual.suma += suma
+		if actual.filas >= a.filasPorParte {
+			actual = nil
+		}
+	}
+	return res, filas.Err()
 }
 
 func (a *Archivador) exportarYBorrar(ctx context.Context, tareaID int64, res *Resultado) error {
-	filas, err := a.pool.Query(ctx, fmt.Sprintf(`
-		SELECT id, periodo, orden_id, cuenta_id, contraparte_id, monto_centavos, tramo, creado_en
-		FROM %s ORDER BY cuenta_id, creado_en, id`, res.Particion))
-	if err != nil {
-		return fmt.Errorf("leer particion: %w", err)
-	}
-
-	var cuerpo bytes.Buffer
-	comprimido := gzip.NewWriter(&cuerpo)
-	codificador := json.NewEncoder(comprimido)
-	var filasLeidas, suma int64
-	for filas.Next() {
-		var e Asiento
-		var periodo time.Time
-		if err := filas.Scan(&e.ID, &periodo, &e.OrdenID, &e.CuentaID, &e.ContraparteID,
-			&e.MontoCentavos, &e.Tramo, &e.CreadoEn); err != nil {
-			filas.Close()
-			return err
-		}
-		e.Periodo = periodo.Format("2006-01-02")
-		if err := codificador.Encode(e); err != nil {
-			filas.Close()
-			return err
-		}
-		filasLeidas++
-		suma += e.MontoCentavos
-	}
-	filas.Close()
-	if err := filas.Err(); err != nil {
-		return err
-	}
-	res.Filas, res.SumaCentavos = filasLeidas, suma
-
-	var filasControl, sumaControl int64
-	if err := a.pool.QueryRow(ctx, fmt.Sprintf(
-		`SELECT count(*), coalesce(sum(monto_centavos), 0) FROM %s`, res.Particion),
-	).Scan(&filasControl, &sumaControl); err != nil {
-		return err
-	}
-	if filasControl != filasLeidas || sumaControl != suma {
-		return fmt.Errorf("la exportacion no coincide con la particion: %d/%d filas, %d/%d centavos",
-			filasLeidas, filasControl, suma, sumaControl)
-	}
-
-	if err := comprimido.Close(); err != nil {
-		return err
-	}
-
-	clave := ClaveDe(res.Periodo)
-	uri, err := a.obj.Guardar(ctx, clave, cuerpo.Bytes(), "application/gzip")
+	rangos, err := a.rangos(ctx, res.Particion)
 	if err != nil {
 		return err
 	}
-	res.Objeto = uri
-	res.Clave = clave
 
-	if _, err := a.pool.Exec(ctx, `
-		UPDATE periodos_archivados
-		SET clave = $2, uri = $3, filas = $4, suma_centavos = $5, archivado_en = now()
-		WHERE periodo = $1::date`,
-		res.Periodo+"-01", clave, uri, filasLeidas, suma); err != nil {
+	partes := make([]Parte, len(rangos))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(a.paralelismo)
+	for i, r := range rangos {
+		g.Go(func() error {
+			p, err := a.escribirParte(gctx, res, i, r)
+			partes[i] = p
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	var filasEscritas, suma int64
+	for _, p := range partes {
+		filasEscritas += p.Filas
+		suma += p.SumaCentavos
+	}
+	res.Filas, res.SumaCentavos, res.Partes = filasEscritas, suma, len(partes)
+
+	prefijo := PrefijoDe(res.Periodo)
+	res.Clave = prefijo
+	res.Objeto = prefijo
+	if len(partes) > 0 {
+		res.Objeto = strings.TrimSuffix(partes[0].URI, path.Base(partes[0].Clave))
+	}
+
+	err = pg.EnTx(ctx, a.pool, func(tx pgx.Tx) error {
+		periodo := res.Periodo + "-01"
+		if _, err := tx.Exec(ctx, `DELETE FROM archivo_partes WHERE periodo = $1::date`, periodo); err != nil {
+			return err
+		}
+		for _, p := range partes {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO archivo_partes
+				    (periodo, parte, clave, cuenta_min, cuenta_max, filas, suma_centavos, bytes)
+				VALUES ($1::date, $2, $3, $4, $5, $6, $7, $8)`,
+				periodo, p.Numero, p.Clave, p.CuentaMin, p.CuentaMax, p.Filas, p.SumaCentavos, p.Bytes); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE periodos_archivados
+			SET clave = $2, uri = $3, filas = $4, suma_centavos = $5, archivado_en = now()
+			WHERE periodo = $1::date`,
+			periodo, prefijo, res.Objeto, filasEscritas, suma)
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("registrar el periodo archivado: %w", err)
 	}
 
@@ -257,4 +313,63 @@ func (a *Archivador) exportarYBorrar(ctx context.Context, tareaID int64, res *Re
 	}
 	_, err = a.pool.Exec(ctx, `UPDATE tareas SET estado = 'hecha' WHERE id = $1`, tareaID)
 	return err
+}
+
+func (a *Archivador) escribirParte(ctx context.Context, res *Resultado, numero int, r rango) (Parte, error) {
+	p := Parte{Numero: numero, Clave: ClaveParte(res.Periodo, numero), CuentaMin: r.desde, CuentaMax: r.hasta}
+
+	subido, err := a.obj.Subir(ctx, p.Clave, TipoParquet, func(w io.Writer) error {
+		filas, err := a.pool.Query(ctx, fmt.Sprintf(`
+			SELECT id, orden_id, cuenta_id, contraparte_id, monto_centavos, tramo, creado_en
+			FROM %s WHERE cuenta_id BETWEEN $1 AND $2
+			ORDER BY cuenta_id, creado_en, id`, res.Particion), r.desde, r.hasta)
+		if err != nil {
+			return fmt.Errorf("leer particion: %w", err)
+		}
+		defer filas.Close()
+
+		escritor := nuevoEscritor(w, a.filasPorBloque)
+		lote := make([]Fila, 0, 1024)
+		for filas.Next() {
+			var f Fila
+			if err := filas.Scan(&f.ID, &f.OrdenID, &f.CuentaID, &f.ContraparteID,
+				&f.MontoCentavos, &f.Tramo, &f.CreadoEn); err != nil {
+				return err
+			}
+			f.CreadoEn = f.CreadoEn.UTC()
+			p.Filas++
+			p.SumaCentavos += f.MontoCentavos
+			if lote = append(lote, f); len(lote) == cap(lote) {
+				if _, err := escritor.Write(lote); err != nil {
+					return err
+				}
+				lote = lote[:0]
+			}
+		}
+		if err := filas.Err(); err != nil {
+			return err
+		}
+		if _, err := escritor.Write(lote); err != nil {
+			return err
+		}
+		return escritor.Close()
+	})
+	if err != nil {
+		return p, fmt.Errorf("escribir %s: %w", p.Clave, err)
+	}
+	p.Bytes, p.URI = subido.Bytes, subido.URI
+
+	if r.filas != p.Filas || r.suma != p.SumaCentavos {
+		return p, fmt.Errorf("%s no coincide con la particion: %d/%d filas, %d/%d centavos",
+			p.Clave, p.Filas, r.filas, p.SumaCentavos, r.suma)
+	}
+
+	enArchivo, err := a.lector.ContarFilas(ctx, p.Clave, p.Bytes)
+	if err != nil {
+		return p, fmt.Errorf("releer %s: %w", p.Clave, err)
+	}
+	if enArchivo != p.Filas {
+		return p, fmt.Errorf("%s quedo con %d filas y se escribieron %d", p.Clave, enArchivo, p.Filas)
+	}
+	return p, nil
 }

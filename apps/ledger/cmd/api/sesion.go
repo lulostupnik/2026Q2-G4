@@ -14,6 +14,8 @@ import (
 
 type claveSesion struct{}
 
+const cabeceraIDToken = "X-Id-Token"
+
 type Sesion struct {
 	Sub      string
 	CuentaID int64

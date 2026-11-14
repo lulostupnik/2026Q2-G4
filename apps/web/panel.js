@@ -330,6 +330,11 @@ async function pintarExtracto({ cuerpo }) {
     const consultar = accion('Consultar', async () => {
       mostrarExportacion(await exigir('GET', `/exportaciones/${x.id}`));
     });
+    // La URL prefirmada vence en minutos: se pide una nueva en cada descarga.
+    const descargar = accion('Descargar', async () => {
+      const d = await exigir('GET', `/exportaciones/${x.id}/descarga`);
+      window.location.assign(d.url);
+    });
     salidaExportacion.replaceChildren(
       el('div', { style: 'height:.75rem' }),
       el('div', { clase: 'rejilla' },
@@ -341,11 +346,17 @@ async function pintarExtracto({ cuerpo }) {
         x.uri ? dato('Objeto', x.uri, 'mono') : null,
         x.motivo ? dato('Motivo', x.motivo) : null),
       el('div', { style: 'height:.75rem' }),
-      el('div', { clase: 'fila-botones' }, consultar));
+      el('div', { clase: 'fila-botones' }, x.estado === 'lista' ? descargar : consultar));
   };
 
   const exportar = accion('Exportar', async () => {
-    mostrarExportacion(await exigir('POST', '/exportaciones', { cuerpo: { desde: desde.value, hasta: hasta.value } }));
+    let x = await exigir('POST', '/exportaciones', { cuerpo: { desde: desde.value, hasta: hasta.value } });
+    mostrarExportacion(x);
+    for (let i = 0; i < 20 && x.estado === 'pendiente'; i++) {
+      await new Promise((listo) => setTimeout(listo, 1500));
+      x = await exigir('GET', `/exportaciones/${x.id}`);
+      mostrarExportacion(x);
+    }
   });
 
   cuerpo.replaceChildren(
