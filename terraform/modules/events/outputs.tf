@@ -3,6 +3,11 @@ output "topic_arn" {
   value       = aws_sns_topic.events.arn
 }
 
+output "titulares_topic_arn" {
+  description = "Topic de los avisos por mail a cada titular (TITULARES_TOPIC_ARN): cada suscripción filtra por su titular."
+  value       = aws_sns_topic.titulares.arn
+}
+
 output "alerts_topic_arn" {
   description = "Topic de alertas de operación: la alarma de la DLQ del webhook."
   value       = aws_sns_topic.alerts.arn

@@ -14,6 +14,12 @@ variable "noncurrent_version_days" {
   default     = 30
 }
 
+variable "incomplete_multipart_days" {
+  description = "Días después de los que se abortan las subidas multipart sin terminar, para no pagar las partes que quedaron subidas."
+  type        = number
+  default     = 1
+}
+
 variable "transitions" {
   description = "Transiciones de clases de almacenamiento."
   type = map(object({
@@ -35,7 +41,6 @@ variable "transitions" {
     }
   }
 }
-
 
 variable "expirations" {
   description = "Prefijos cuyos objetos expiran después de unos días (por ejemplo, los resultados de Athena). Con el versionado, expirar los deja como versión anterior, que se borra a los noncurrent_version_days."

@@ -52,9 +52,42 @@ variable "api_instance_type" {
 }
 
 variable "archive_instance_type" {
-  description = "Tipo de instancia del host del archivador."
+  description = "Tipo de instancia del host del archivador. Escribe varias partes de Parquet en paralelo, cada una con un bloque en memoria: necesita unos 3 GB."
   type        = string
-  default     = "t3.micro"
+  default     = "t3.medium"
+}
+
+variable "archive_rows_per_part" {
+  description = "Filas por archivo Parquet de un mes archivado. Cada parte agrupa un rango de cuentas, y una cuenta nunca queda en dos partes."
+  type        = number
+  default     = 5000000
+
+  validation {
+    condition     = var.archive_rows_per_part >= 1
+    error_message = "Cada parte del archivo tiene que llevar al menos una fila."
+  }
+}
+
+variable "archive_rows_per_row_group" {
+  description = "Filas por bloque (row group) dentro de cada parte. El extracto de una cuenta saltea los bloques que no la tienen y, en los demás, baja sólo sus páginas."
+  type        = number
+  default     = 1000000
+
+  validation {
+    condition     = var.archive_rows_per_row_group >= 1 && var.archive_rows_per_row_group <= var.archive_rows_per_part
+    error_message = "Un bloque lleva al menos una fila y no más que su parte: archive_rows_per_row_group tiene que estar entre 1 y archive_rows_per_part."
+  }
+}
+
+variable "export_retention_days" {
+  description = "Días que queda en S3 el archivo de una exportación. La URL de descarga vence en minutos y se firma de nuevo en cada pedido."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.export_retention_days >= 1
+    error_message = "Una exportación tiene que quedar al menos un día: es lo que tiene el titular para descargarla."
+  }
 }
 
 variable "db_engine_version" {

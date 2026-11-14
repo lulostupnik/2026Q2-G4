@@ -59,6 +59,17 @@ resource "aws_s3_bucket_lifecycle_configuration" "this" {
   bucket = local.bucket_name
 
   rule {
+    id     = "incomplete-multipart"
+    status = "Enabled"
+
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = var.incomplete_multipart_days
+    }
+  }
+
+  rule {
     id     = "noncurrent-versions"
     status = "Enabled"
 

@@ -100,6 +100,21 @@ jobs:
         working-directory: .
         run: echo "TF_VAR_image_tag=$(make -s tag)" >> "$GITHUB_ENV"
 
+      # Una variable number no acepta un TF_VAR vacío: sólo se pasan las que están cargadas, y las
+      # demás toman el default de variables.tf.
+      - name: variables opcionales
+        if: steps.credenciales.outputs.disponibles == 'true'
+        env:
+          ARCHIVE_ROWS_PER_PART: ${{ vars.ARCHIVE_ROWS_PER_PART }}
+          ARCHIVE_ROWS_PER_ROW_GROUP: ${{ vars.ARCHIVE_ROWS_PER_ROW_GROUP }}
+        run: |
+          if [ -n "$ARCHIVE_ROWS_PER_PART" ]; then
+            echo "TF_VAR_archive_rows_per_part=$ARCHIVE_ROWS_PER_PART" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$ARCHIVE_ROWS_PER_ROW_GROUP" ]; then
+            echo "TF_VAR_archive_rows_per_row_group=$ARCHIVE_ROWS_PER_ROW_GROUP" >> "$GITHUB_ENV"
+          fi
+
       - name: plan
         if: steps.credenciales.outputs.disponibles == 'true'
         run: |

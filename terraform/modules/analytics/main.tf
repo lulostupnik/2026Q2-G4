@@ -9,7 +9,7 @@ locals {
     { name = "contraparte_id", type = "bigint", comment = "La otra cuenta del par" },
     { name = "monto_centavos", type = "bigint", comment = "Positivo entra a la cuenta, negativo sale" },
     { name = "tramo", type = "string", comment = "transferencia, reserva, liquidacion, reversa, ingreso_banco, ingreso_acreditacion o semilla" },
-    { name = "creado_en", type = "string", comment = "RFC 3339; usar from_iso8601_timestamp(creado_en)" },
+    { name = "creado_en", type = "timestamp", comment = "Momento del asiento, en UTC" },
   ]
 
   queries = {
@@ -57,14 +57,14 @@ locals {
       description = "Los movimientos archivados de una cuenta, en todos los meses (parámetro: cuenta_id)"
       query       = <<-SQL
         SELECT periodo,
-               from_iso8601_timestamp(creado_en) AS creado_en,
+               creado_en,
                orden_id,
                contraparte_id,
                tramo,
                monto_centavos / 100.0            AS monto_pesos
         FROM asientos
         WHERE cuenta_id = ?
-        ORDER BY from_iso8601_timestamp(creado_en), id
+        ORDER BY creado_en, id
       SQL
     }
   }
@@ -78,13 +78,12 @@ resource "aws_glue_catalog_database" "this" {
 resource "aws_glue_catalog_table" "asientos" {
   name          = "asientos"
   database_name = aws_glue_catalog_database.this.name
-  description   = "Asientos de los meses archivados: un objeto asientos.ndjson.gz por mes"
+  description   = "Asientos de los meses archivados: uno o más archivos Parquet por mes, cada uno con un rango de cuentas"
   table_type    = "EXTERNAL_TABLE"
 
   parameters = {
     EXTERNAL                           = "TRUE"
-    classification                     = "json"
-    compressionType                    = "gzip"
+    classification                     = "parquet"
     "projection.enabled"               = "true"
     "projection.periodo.type"          = "date"
     "projection.periodo.format"        = "yyyy-MM"
@@ -102,15 +101,11 @@ resource "aws_glue_catalog_table" "asientos" {
 
   storage_descriptor {
     location      = local.history_location
-    input_format  = "org.apache.hadoop.mapred.TextInputFormat"
-    output_format = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
-    compressed    = true
+    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
 
     ser_de_info {
-      serialization_library = "org.openx.data.jsonserde.JsonSerDe"
-      parameters = {
-        "ignore.malformed.json" = "FALSE"
-      }
+      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
     }
 
     dynamic "columns" {

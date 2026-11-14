@@ -46,22 +46,24 @@ locals {
       cpu_target        = 60
       schedule          = {}
       environment = {
-        APP_PORT          = tostring(var.app_port)
-        S3_BUCKET         = module.storage.bucket_name
-        AWS_REGION        = var.aws_region
-        COGNITO_ISSUER    = module.auth.issuer
-        COGNITO_CLIENT_ID = module.auth.client_id
-        CORS_ORIGENES     = module.website.website_url
-        PROVEEDOR_URL     = coalesce(var.proveedor_url, "${local.api_url}/servicio-mock")
-        SNS_TOPIC_ARN     = module.events.topic_arn
+        APP_PORT            = tostring(var.app_port)
+        S3_BUCKET           = module.storage.bucket_name
+        AWS_REGION          = var.aws_region
+        COGNITO_ISSUER      = module.auth.issuer
+        COGNITO_CLIENT_ID   = module.auth.client_id
+        CORS_ORIGENES       = module.website.website_url
+        PROVEEDOR_URL       = coalesce(var.proveedor_url, "${local.api_url}/servicio-mock")
+        SNS_TOPIC_ARN       = module.events.topic_arn
+        TITULARES_TOPIC_ARN = module.events.titulares_topic_arn
+        APP_URL             = module.website.website_url
       }
     }
     archive = {
       command           = ["/archivador"]
       instance_type     = var.archive_instance_type
       target_capacity   = 100
-      cpu               = 512
-      memory            = 256
+      cpu               = 1024
+      memory            = 3072
       port              = null
       target_group_arn  = null
       subnet_ids        = module.vpc.intra_subnets
@@ -71,8 +73,10 @@ locals {
       cpu_target        = null
       schedule          = var.archive_schedule
       environment = {
-        S3_BUCKET  = module.storage.bucket_name
-        AWS_REGION = var.aws_region
+        S3_BUCKET                  = module.storage.bucket_name
+        AWS_REGION                 = var.aws_region
+        ARCHIVADO_FILAS_POR_PARTE  = tostring(var.archive_rows_per_part)
+        ARCHIVADO_FILAS_POR_BLOQUE = tostring(var.archive_rows_per_row_group)
       }
     }
   }

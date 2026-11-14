@@ -1,9 +1,11 @@
 # storage
 
-Bucket S3 del proyecto: guarda los meses archivados del ledger (`transaction-history/`), las
-exportaciones (`exports/`) y los resultados de Athena (`athena-results/`, que expiran por
-`expirations`). Se accede por el gateway endpoint, sin pasar por el NAT. Se cifra con la clave KMS del proyecto (SSE-KMS) y su
-política rechaza los pedidos que no usan HTTPS.
+Bucket S3 del proyecto: guarda los meses archivados del ledger (`transaction-history/`, en
+Parquet), las exportaciones (`exports/`) y los resultados de Athena (`athena-results/`); los dos
+últimos expiran por `expirations`. Se accede por el gateway endpoint, sin pasar por el NAT. Se
+cifra con la clave KMS del proyecto (SSE-KMS) y su política rechaza los pedidos que no usan
+HTTPS. El archivador y las exportaciones suben por multipart, así que el lifecycle aborta las
+subidas que quedan sin terminar (`incomplete_multipart_days`).
 
 El bucket no lo crea el módulo sino [`scripts/buckets.sh`](../../../scripts/buckets.sh), antes del
 apply: el SCP de AWS Academy niega `s3:GetBucketObjectLockConfiguration`, que `aws_s3_bucket`

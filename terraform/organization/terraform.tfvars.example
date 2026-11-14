@@ -5,7 +5,11 @@
 # aws_region            = "us-east-1"
 # vpc_cidr              = "10.0.0.0/16"
 # api_instance_type     = "c7g.large"
-# archive_instance_type = "t3.micro"
+# archive_instance_type = "t3.medium"
+
+# archive_rows_per_part      = 5000000 # filas por archivo Parquet de un mes archivado
+# archive_rows_per_row_group = 1000000 # filas por bloque dentro de cada archivo
+# export_retention_days      = 7       # días que queda en S3 el archivo de una exportación
 
 # db_instance_class  = "db.t3.micro"
 # db_multi_az        = false # para probar: el apply tarda la mitad

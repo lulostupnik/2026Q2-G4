@@ -60,12 +60,13 @@ output "ecs_cluster_name" {
 }
 
 output "events" {
-  description = "Eventos del ledger: topic donde publica la API, cola y DLQ del webhook, topic de alertas."
+  description = "Eventos del ledger: topic donde publica la API, cola y DLQ del webhook, topic de avisos a titulares y topic de alertas."
   value = {
-    topic_arn         = module.events.topic_arn
-    alerts_topic_arn  = module.events.alerts_topic_arn
-    webhook_queue_url = module.events.webhook_queue_url
-    webhook_dlq_url   = module.events.webhook_dlq_url
+    topic_arn           = module.events.topic_arn
+    titulares_topic_arn = module.events.titulares_topic_arn
+    alerts_topic_arn    = module.events.alerts_topic_arn
+    webhook_queue_url   = module.events.webhook_queue_url
+    webhook_dlq_url     = module.events.webhook_dlq_url
   }
 }
 

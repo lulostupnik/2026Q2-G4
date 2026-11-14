@@ -5,6 +5,8 @@ Eventos del ledger. La API publica cada orden terminada en el topic `events`, qu
 - **Webhook:** SNS → SQS (+DLQ) → Lambda, que firma el aviso con HMAC y hace el POST. Los
   reintentos son de SQS; lo que los agota queda en la DLQ y dispara una alarma.
 - **Alertas:** topic aparte, con suscripciones de email para operación.
+- **Titulares:** topic `titulares`, con una suscripción de email por titular. Lo usa la API para
+  avisarle a cada uno lo suyo (hoy, que su exportación está lista).
 
 ## Contrato del evento
 
@@ -30,6 +32,13 @@ La API publica en `SNS_TOPIC_ARN` un mensaje por orden que llega a un estado ter
 
 `evento_id` es `<orden_id>:<estado>`: el mismo evento tiene siempre el mismo id, así que el
 receptor del webhook puede descartar los duplicados.
+
+## Contrato de los avisos a titulares
+
+La API suscribe el email de cada titular a `TITULARES_TOPIC_ARN` con el *filter policy*
+`{"titular": ["<sub de Cognito>"]}`, y publica cada aviso con el atributo `titular` (`String`)
+igual a ese `sub`: SNS se lo entrega sólo a esa suscripción. El cuerpo es texto plano, porque
+llega como mail. SNS admite 200 *filter policies* por topic.
 
 <!-- BEGIN_TF_DOCS -->
 ## Requirements

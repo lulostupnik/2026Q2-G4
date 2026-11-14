@@ -115,6 +115,11 @@ resource "aws_lambda_function" "this" {
   depends_on = [aws_cloudwatch_log_group.this]
 }
 
+resource "aws_sns_topic" "titulares" {
+  name              = "${var.name_prefix}-titulares"
+  kms_master_key_id = var.kms_key_arn
+}
+
 resource "aws_sns_topic" "alerts" {
   name              = "${var.name_prefix}-alerts"
   kms_master_key_id = var.kms_key_arn

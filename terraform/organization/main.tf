@@ -16,6 +16,7 @@ module "storage" {
 
   expirations = {
     "athena-results" = { prefix = local.athena_results_prefix, days = 7 }
+    "exports"        = { prefix = "exports/", days = var.export_retention_days }
   }
 }
 
