@@ -22,7 +22,7 @@ Restricciones que guían el diseño:
   GitHub Actions, en cualquier cuenta, sin editar nada. Los nombres que tienen que ser únicos
   llevan el ID de la cuenta.
 - **Costo acotado**: un solo NAT, la API en Graviton (más barato que x86 a igual tamaño) y el
-  archivador en una `t3.micro`, apagada fuera de su ventana.
+  archivador en una `t3.medium`, apagada fuera de su ventana.
 
 ## 2. Red
 
@@ -107,14 +107,15 @@ propio ASG, en sus propias subredes:
 |---|---|---|
 | Subredes (instancias y tareas) | `app`, con NAT | `archive`, sin ruta a Internet |
 | Tareas | 2 a 5, escalan por CPU (60 %) | 0, y 1 durante la ventana de archivado |
-| Tipo de instancia | `c7g.large` (Graviton), dos tareas por instancia | `t3.micro`, una tarea |
+| Tipo de instancia | `c7g.large` (Graviton), dos tareas por instancia | `t3.medium`, una tarea |
 | Instancias | Las que hagan falta para esas tareas, con lugar libre | 0 fuera de la ventana |
 | Tráfico | NLB → IP de cada tarea | Ninguno: sólo sale a la base y a S3 |
 
 Hay **dos niveles de escalado**: el servicio decide cuántas tareas quiere (por CPU o por
 horario) y el capacity provider agrega o apaga instancias para alojarlas. Con red `awsvpc`
 cada tarea tiene su propia ENI y su security group, y la instancia se queda una para ella: una
-`c7g.large` (3 ENIs) aloja dos tareas y una `t3.micro` (2 ENIs), una sola.
+`c7g.large` (3 ENIs) aloja dos tareas, y la `t3.medium` del archivador, una sola: la tarea pide
+3 GB de los 4 que tiene.
 
 El capacity provider de la API apunta a tener ocupado el 80 % de las instancias
 (`target_capacity`), para dejar lugar de reserva: la primera tarea nueva de un scale-out o de un
@@ -135,7 +136,9 @@ recomendada, pero sólo la usan las instancias nuevas.
 corre en `c7g.large`: no es burstable, así que su CPU no depende de créditos; Graviton cuesta
 menos que x86 a igual tamaño, y sus 2 vCPU coinciden con las dos tareas de 1 vCPU que le
 permiten sus ENIs. El archivador es un batch de una tarea, unas horas por día, que nadie
-espera: alcanza una `t3.micro`, cuya CPU en ráfaga cubre justo esa ventana. En una cuenta
+espera, así que va en una instancia burstable: su CPU en ráfaga cubre esa ventana. Es una
+`t3.medium` por la memoria: escribe varias partes de Parquet en paralelo y cada una arma un
+bloque en memoria antes de subirlo (ver [Datos](#4-datos)). En una cuenta
 propia iría en **Spot**, que AWS Academy no habilita. El archivado se puede retomar: cada
 período es una fila de `tareas` que se toma con `FOR UPDATE SKIP LOCKED` y, si la instancia se
 interrumpe, se reintenta, así que una interrupción sólo lo atrasa. Se configuraría con un ASG
@@ -184,7 +187,7 @@ toma la recomendada en cada apply, pero sólo la usan las instancias nuevas. No 
 Un deploy con cambios en el backend sube una imagen nueva y crea una revisión de cada task
 definition. ECS reemplaza las tareas de a tandas: nunca baja de la mitad de las deseadas ni pasa
 del doble. El ASG admite una instancia más que el máximo de tareas, y eso alcanza para ese doble
-en los dos servicios: 6 `c7g.large` alojan 12 tareas de la API y 2 `t3.micro`, dos del
+en los dos servicios: 6 `c7g.large` alojan 12 tareas de la API y 2 `t3.medium`, dos del
 archivador. Por eso la API llega a 5 tareas y no más: su ASG queda en 6, el máximo que AWS
 Academy deja poner en un ASG. Una
 tarea nueva de la API recibe tráfico recién cuando pasa el health check del NLB, y si las
@@ -237,11 +240,51 @@ reintentos.
   derivado y muestra si coinciden.
 
 **Archivado.** El archivador toma un período de la tabla `tareas` (`FOR UPDATE SKIP LOCKED`),
-hace `DETACH PARTITION` de ese mes, lo sube a S3 como
-`transaction-history/periodo=AAAA-MM/asientos.ndjson.gz` (un prefijo estilo Hive, que se
-consulta con Athena) y borra la partición. No hay un `DELETE` masivo que genere WAL ni compita
-por bloqueos con la liquidación. El extracto de un mes archivado lo arma la API leyendo ese
-objeto.
+hace `DETACH PARTITION` de ese mes, lo sube a S3 y borra la partición. No hay un `DELETE` masivo
+que genere WAL ni compita por bloqueos con la liquidación.
+
+El mes se guarda en **Parquet**, partido por rangos de cuentas, bajo un prefijo estilo Hive que
+se consulta con Athena:
+
+```
+transaction-history/periodo=2025-06/parte-000.parquet   cuentas 1 – 41.200
+transaction-history/periodo=2025-06/parte-001.parquet   cuentas 41.201 – 83.950
+```
+
+- **Partes.** El archivador cuenta las filas de cada cuenta y las agrupa hasta
+  `archive_rows_per_part` (5 millones por defecto). Una cuenta nunca queda en dos partes. Las
+  partes se escriben en paralelo, cada una con su conexión, y se suben por multipart a medida
+  que se escriben: la memoria queda acotada a un bloque por parte y no depende del tamaño del
+  mes.
+- **Bloques.** Cada parte se ordena por cuenta y fecha y se divide en bloques (*row groups*)
+  de `archive_rows_per_row_group` filas. Parquet guarda el mínimo y el máximo de cada columna
+  por bloque, así que cada bloque cubre un rango chico de cuentas.
+- **Verificación.** Antes de borrar la partición, cada parte se compara con la base (filas y
+  suma de montos de su rango de cuentas, sacadas del mismo recuento que arma las partes) y se
+  relee su pie desde S3 para confirmar que quedó entera. Como el recuento cubre toda la
+  partición, si coinciden todas las partes coincide el total. Si algo no coincide, la partición
+  queda desenganchada pero intacta y el archivado se reintenta.
+- **Índice.** `archivo_partes` guarda, por mes, cada parte con su rango de cuentas, sus filas
+  y su tamaño, en la misma transacción que marca el mes como archivado.
+
+**Extracto de un mes archivado.** La API busca en `archivo_partes` la parte que tiene la cuenta,
+lee el pie del archivo con un GET por rango (unos KB, con el mínimo y el máximo de cuentas de
+cada bloque y el índice de páginas) y elige el bloque de la cuenta. Dentro del bloque, el índice
+dice qué páginas de `cuenta_id` tienen la cuenta y dónde está cada página de las demás columnas,
+así que la API baja sólo esas páginas, con unos pocos GET por rango en paralelo. Los archivos no
+cambian, así que el pie queda en memoria: un extracto trae de S3 decenas o cientos de KB, sin
+importar cuánto pese el mes ni el bloque. Las respuestas son las mismas que cuando el mes está
+en la base.
+
+**Exportaciones.** `POST /exportaciones` registra la solicitud y responde enseguida; un proceso
+de cada tarea de la API la toma (`FOR UPDATE SKIP LOCKED`, con un plazo de 15 minutos por si la
+tarea muere a mitad de camino), recorre los meses de la base y del archivo y sube el resultado a
+`exports/` en streaming. Cuando queda lista, `GET /exportaciones/{id}/descarga` firma una URL
+prefirmada de S3 que vence a los 15 minutos, y el archivo se baja directo de S3, sin pasar por
+la API. Lo que dura días es el archivo (`export_retention_days`), no el link: cada descarga firma
+uno nuevo. Un link largo no conviene porque cualquiera que lo tenga descarga el extracto, y
+además una URL prefirmada deja de valer cuando vencen las credenciales temporales del rol que la
+firmó.
 
 ### Análisis del archivo con Athena
 
@@ -250,16 +293,18 @@ preguntas que cruzan meses y cuentas (si cada mes cuadra, cuánto se movió por 
 completa de una cuenta) se responden con SQL sobre el archivo, en Athena
 ([`modules/analytics`](terraform/modules/analytics)), sin cargar la base que liquida los pagos.
 
-- **Catálogo.** Una base de Glue con la tabla externa `asientos` sobre `transaction-history/`:
-  JSON por línea comprimido con gzip, que es lo que ya escribe el archivador, así que no cambia
-  el código. `creado_en` queda como string RFC 3339 (se convierte en la consulta con
-  `from_iso8601_timestamp`), y el `periodo` del JSON no es columna: es la partición, porque Glue
-  no acepta una columna y una partición con el mismo nombre.
+- **Catálogo.** Una base de Glue con la tabla externa `asientos` sobre `transaction-history/`,
+  en Parquet. Athena lee sólo las columnas de cada consulta, reparte las partes y sus bloques
+  entre varios workers y, con un filtro por `cuenta_id`, saltea los bloques que no la tienen.
+  `creado_en` es un `timestamp` en UTC, y `periodo` no es columna del archivo: es la partición.
 - **Partition projection.** La tabla no registra particiones: Athena las calcula desde
   `history_start` (enero de 2024) hasta el mes actual y arma la ruta de cada una con
   `storage.location.template`. Un mes recién archivado se ve en la próxima consulta, sin
-  `MSCK REPAIR TABLE` y sin crawler, que además necesitaría un rol propio que AWS Academy no deja
-  crear. Un filtro por `periodo` limita lo que se lee a esos meses.
+  `MSCK REPAIR TABLE` y sin crawler. Un crawler sirve para descubrir el esquema y las carpetas de
+  datos que no se controlan; acá los define el propio archivador, así que no hay nada que
+  descubrir, y un crawler sólo sumaría demora (el mes aparece recién cuando vuelve a correr),
+  costo por corrida y el riesgo de inferir mal un tipo. Un filtro por `periodo` limita lo que se
+  lee a esos meses.
 - **Workgroup `ledger`.** Fuerza su configuración sobre la del cliente: los resultados van a
   `athena-results/` del bucket del proyecto, cifrados con SSE-KMS y la clave del proyecto. El
   lifecycle los expira a los 7 días, pero como el bucket está versionado expirar no los borra:
@@ -389,7 +434,7 @@ sumar una suscripción, sin tocar la API.
 
 | Consumidor | Camino | Si falla |
 |---|---|---|
-| Webhook | SNS → SQS `ledger-webhook` → Lambda ([`apps/webhook`](apps/webhook)) → POST firmado | SQS reintenta 5 veces; después va a la DLQ, que dispara una alarma |
+| Webhook | SNS → SQS `ledger-webhook` → Lambda ([`apps/webhook`](apps/webhook)) → POST firmado | SQS lo intenta hasta 5 veces; después va a la DLQ, que dispara una alarma |
 
 - **Por qué lleva cola.** El webhook es un contrato con otro sistema, cuyo endpoint puede estar
   caído un rato: la cola guarda el aviso y lo reintenta, y lo que agota los reintentos queda en
@@ -408,9 +453,16 @@ sumar una suscripción, sin tocar la API.
   Lambda corre fuera de la VPC y hace el POST directo a `webhook_url`. Los topics y las colas
   se cifran con la clave del proyecto, cuya política habilita a SNS (escribe en la cola) y a
   CloudWatch (publica las alarmas en el topic).
-- **Sin mails a los titulares.** Se descartó mandarlos por SES porque AWS Academy no habilita
-  SES: el rol del laboratorio no tiene permisos de SES (`ses:GetAccount` y
-  `ses:VerifyEmailIdentity` dan `AccessDenied`).
+- **Avisos a los titulares.** El topic `ledger-titulares` manda mails a cada titular; hoy, que
+  su exportación está lista, con el link a la app y no al archivo. Al crear la cuenta, el
+  frontend manda el ID token de Cognito (`X-Id-Token`); la API verifica su firma, que sea del
+  mismo usuario y que el email esté verificado, y suscribe ese email con un *filter policy*
+  `{"titular": ["<sub>"]}`. Cada aviso lleva el `sub` del titular como atributo, así que SNS
+  se lo entrega sólo a esa suscripción. Se filtra por el `sub` de Cognito y no por el id de la
+  cuenta porque el `sub` no se reutiliza: un reinicio de datos puede repetir ids de cuenta.
+  El titular tiene que confirmar la suscripción con el mail que manda AWS. Lo natural para
+  mails a usuarios sería SES, pero AWS Academy no lo habilita: el rol del laboratorio no tiene
+  permisos de SES (`ses:GetAccount` y `ses:VerifyEmailIdentity` dan `AccessDenied`).
 
 ## 8. Frontend
 
@@ -512,11 +564,16 @@ nuevo y Destroy no tendría qué destruir.
   lo evitaría, a costa de tocar la transacción de cada operación.
 - **Sin autenticación IAM en RDS**: la API entra con la credencial de Secrets Manager, y
   habilitarla sólo sumaría una vía de login que nadie usa.
-- **El archivo queda en JSON y no en Parquet.** Athena cobra por byte escaneado, y Parquet,
-  columnar y con estadísticas, leería sólo las columnas de cada consulta. Con el volumen de este
-  sistema un mes comprimido pesa poco, y cambiar el formato obligaría a cambiar el archivador y
-  el extracto de la API, que leen el mismo objeto. Si el volumen creciera, un `CREATE TABLE AS
-  SELECT` a Parquet por mes se podría sumar sin tocar lo que ya existe.
+- **Mails a titulares por SNS y no por SES.** SNS admite 200 *filter policies* por topic (10.000
+  por cuenta), así que pasados 200 titulares las suscripciones nuevas fallan y esos titulares
+  quedan sin aviso (la cuenta se crea igual). Cada titular confirma su suscripción, los mails
+  salen de `no-reply@sns.amazonaws.com` en texto plano y traen un link para desuscribirse. En una
+  cuenta propia los avisos irían por SES.
+- **El archivador escala en una sola instancia.** Paraleliza las partes de un mes dentro de una
+  tarea. Si un mes no entrara en la ventana, el paso siguiente es un job de Glue (Spark) que lea
+  la partición por JDBC en paralelo desde una réplica de lectura y escriba estos mismos archivos.
+  Leer de la primaria con muchas conexiones competiría con la liquidación, y el standby
+  Multi-AZ no acepta lecturas.
 - tfsec marca estas decisiones; cada una está ignorada en el código con el motivo al lado.
 
 ## 11. Correcciones de entregas anteriores
